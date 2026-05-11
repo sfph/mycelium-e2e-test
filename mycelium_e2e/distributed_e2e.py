@@ -26,6 +26,7 @@ import httpx
 from mycelium_e2e.bundle import (
     TestContext,
     check,
+    register_room,
     log_info,
     log_debug,
     log_error,
@@ -42,8 +43,13 @@ OCLW3_IP = os.environ.get("OCLW3_IP", "10.0.50.171")
 OCLW5_IP = os.environ.get("OCLW5_IP", "10.0.50.142")
 
 # All services run on oclw4
-BACKEND_URL = os.environ.get("MYCELIUM_BACKEND_URL", f"http://{OCLW4_IP}:8000")
+BACKEND_URL = os.environ.get("MYCELIUM_BACKEND_URL", f"http://{OCLW4_IP}:8000/api")
 MATRIX_HOMESERVER = os.environ.get("MATRIX_HOMESERVER", f"http://{OCLW4_IP}:8008")
+
+# Shared Mycelium room — all gateways (oclw4/3/5) subscribe to this room's
+# SSE via the mycelium-room channel plugin.  Tests spawn sessions within it;
+# the room itself is never recreated or rebound per test.
+SHARED_MYCELIUM_ROOM = os.environ.get("E2E_MYCELIUM_ROOM", "mycelium_room")
 
 # Agent configuration for distributed setup
 DISTRIBUTED_AGENTS = {
@@ -51,6 +57,11 @@ DISTRIBUTED_AGENTS = {
         "device": "oclw4",
         "ip": OCLW4_IP,
         "display_name": "Alpha (oclw4)",
+    },
+    "agent-beta": {
+        "device": "oclw4",
+        "ip": OCLW4_IP,
+        "display_name": "Beta (oclw4)",
     },
     "claire-agent": {
         "device": "oclw3",
@@ -264,49 +275,111 @@ async def wait_for_mycelium_consensus(
     room_name: str,
     timeout_seconds: int = 180,
     poll_interval: int = 5,
+    session_room: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Wait for coordination_consensus in a Mycelium session room.
-    
+
+    If *session_room* is given (e.g. ``mycelium_room:session:abc123``),
+    poll that specific room instead of scanning all sub-rooms.  This is
+    important when many tests share the same parent room.
+
     Returns the consensus content if found, None otherwise.
     """
     start = time.time()
-    
+
     async with httpx.AsyncClient(timeout=30.0) as http:
         while time.time() - start < timeout_seconds:
-            # First, find any session rooms
-            r = await http.get(f"{BACKEND_URL}/rooms")
-            if r.status_code != 200:
-                await asyncio.sleep(poll_interval)
-                continue
-            
-            rooms = r.json()
-            session_rooms = [
-                rm["name"] for rm in rooms 
-                if room_name in rm["name"] and ":session:" in rm["name"]
-            ]
-            
-            for session_room in session_rooms:
+            if session_room:
+                target_rooms = [session_room]
+            else:
+                r = await http.get(f"{BACKEND_URL}/rooms")
+                if r.status_code != 200:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                rooms = r.json()
+                target_rooms = [
+                    rm["name"] for rm in rooms
+                    if room_name in rm["name"] and ":session:" in rm["name"]
+                ]
+
+            for sr in target_rooms:
                 r = await http.get(
-                    f"{BACKEND_URL}/rooms/{quote(session_room, safe='')}/messages",
+                    f"{BACKEND_URL}/rooms/{quote(sr, safe='')}/messages",
                     params={"limit": 50}
                 )
                 if r.status_code != 200:
                     continue
-                
+
                 for msg in r.json().get("messages", []):
                     if msg.get("message_type") == "coordination_consensus":
                         try:
                             content = json.loads(msg.get("content", "{}"))
                         except json.JSONDecodeError:
                             content = {"raw": msg.get("content")}
-                        log_info(f"Consensus found in {session_room}")
+                        log_info(f"Consensus found in {sr}")
                         return content
-            
+
             await asyncio.sleep(poll_interval)
-    
+
     log_warning("Timeout waiting for Mycelium consensus")
     return None
+
+
+async def wait_for_return_trip_message(
+    client: MatrixClient,
+    room_id: str,
+    expected_agents: list[str],
+    timeout_seconds: int = 60,
+    poll_interval: int = 5,
+    after_timestamp: Optional[int] = None,
+) -> dict[str, bool]:
+    """
+    Wait for the plugin's auto-posted return-trip messages in Matrix DMs.
+
+    The cross-channel-return-trip feature posts messages starting with
+    "[Mycelium return trip — " back to the originating Matrix session.
+    Since our tests trigger from the #agents room (not individual DMs),
+    we check for these messages landing in the same room.
+
+    Returns a dict mapping agent handle to whether a return-trip was seen.
+    """
+    seen: dict[str, bool] = {agent: False for agent in expected_agents}
+    start = time.time()
+    seen_events: set[str] = set()
+    cutoff_ts = after_timestamp if after_timestamp else int(time.time() * 1000)
+
+    while time.time() - start < timeout_seconds:
+        messages, _ = await client.read_messages(room_id, limit=100)
+
+        for msg in messages:
+            event_id = msg.get("event_id", "")
+            if event_id in seen_events:
+                continue
+            seen_events.add(event_id)
+
+            msg_ts = msg.get("timestamp", 0)
+            if msg_ts <= cutoff_ts:
+                continue
+
+            body = msg.get("body", "")
+            if "[Mycelium return trip" not in body:
+                continue
+
+            sender = msg.get("sender", "")
+            for agent in expected_agents:
+                if f"@{agent}:local" == sender or agent in sender:
+                    seen[agent] = True
+                    log_info(f"Return-trip message seen from {agent}: {body[:80]}...")
+
+        if all(seen.values()):
+            log_info(f"All {len(expected_agents)} return-trip messages received")
+            return seen
+
+        await asyncio.sleep(poll_interval)
+
+    log_warning(f"Timeout waiting for return-trip messages. Seen: {seen}")
+    return seen
 
 
 async def post_consensus_summary(
@@ -367,6 +440,9 @@ Outcome:
         return False
 
 
+OPENCLAW_JSON_PATH = os.path.expanduser("~/.openclaw/openclaw.json")
+
+
 async def trigger_distributed_negotiation(
     ctx: DistributedTestContext,
     agent_handles: list[str],
@@ -375,31 +451,33 @@ async def trigger_distributed_negotiation(
 ) -> tuple[bool, int]:
     """
     Trigger a negotiation by sending a message to agents via Matrix.
-    
-    The agents should pick up the message, invoke their mycelium hooks,
-    and participate in the coordination session.
-    
+
+    All gateways (oclw4/3/5) already subscribe to SHARED_MYCELIUM_ROOM via
+    the mycelium-room channel plugin, so no openclaw.json patching or
+    gateway restart is needed.  We just spawn a session and send the Matrix
+    trigger.
+
     Returns:
         (success, timestamp_ms): success bool and the timestamp when the trigger was sent.
     """
     log_info(f"Triggering distributed negotiation: {topic}")
     log_info(f"Agents: {', '.join(agent_handles)}")
-    
+
     # Wait 15 seconds to let any previous tests fully complete and agent messages flush
     log_info("Waiting 15 seconds to flush old messages...")
     await asyncio.sleep(15)
-    
+
     # Record when we're sending the trigger
     trigger_ts = int(time.time() * 1000)
-    
+
     try:
         ctx.observer_token = await get_observer_token()
-        
+
         # Get or create dedicated test room (keeps tests separate from manual user interactions)
         test_room_alias, test_room_id = await get_or_create_test_room(ctx.observer_token, agent_handles)
-        
+
         observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        
+
         # Join the test room as observer
         try:
             await observer._http.post(
@@ -408,45 +486,26 @@ async def trigger_distributed_negotiation(
             )
         except Exception:
             pass  # Already joined
-        
-        # Create a unique room name for this test
-        ctx.mycelium_room_name = f"dist-e2e-{uuid.uuid4().hex[:8]}"
 
-        # Pre-create the room + session server-side so the agents don't
-        # have to run `mycelium room create` / `mycelium session create`
-        # themselves. Those are coordinator-side actions per the e2e
-        # SKILL.md Phase 3 (room create → session create → session join);
-        # having the agents run them races on who wins the first create
-        # and — on leaf nodes where the per-agent OpenClaw allowlist
-        # doesn't cover `mycelium room create` — silently stalls the
-        # whole test on approval gates.
-        #
-        # IMPORTANT: use /sessions/spawn, not /sessions. The latter is
-        # the participant-join endpoint (requires agent_handle, adds a
-        # voter) and a prior revision of this helper called it with
-        # agent_handle="test-harness", which registered a phantom voter
-        # that blocked consensus forever. /sessions/spawn is what the
-        # CLI's `mycelium session create` hits — empty coordination
-        # session, no participants, agents join via `session join` from
-        # their leaf nodes exactly as the SKILL documents.
+        # Use the shared Mycelium room — all gateways are already subscribed.
+        ctx.mycelium_room_name = SHARED_MYCELIUM_ROOM
+
+        # Spawn a session.  The plugin's 5s poll discovers the new sub-room
+        # and subscribes to its SSE.  One full poll cycle (8s) is enough
+        # because the gateway is already connected to the parent room.
         async with httpx.AsyncClient(timeout=30.0) as http:
-            r = await http.post(
-                f"{BACKEND_URL}/rooms",
-                json={"name": ctx.mycelium_room_name, "mode": "coordination"},
+            r2 = await http.post(
+                f"{BACKEND_URL}/rooms/{ctx.mycelium_room_name}/sessions/spawn",
             )
-            if r.status_code not in (200, 201):
+            if r2.status_code not in (200, 201):
                 log_warning(
-                    f"Pre-create of {ctx.mycelium_room_name} returned {r.status_code}; "
-                    f"agents will fall back to `mycelium room use …` and may need to create it"
+                    f"Pre-spawn session for {ctx.mycelium_room_name} returned {r2.status_code}"
                 )
             else:
-                r2 = await http.post(
-                    f"{BACKEND_URL}/rooms/{ctx.mycelium_room_name}/sessions/spawn",
-                )
-                if r2.status_code not in (200, 201):
-                    log_warning(
-                        f"Pre-spawn session for {ctx.mycelium_room_name} returned {r2.status_code}"
-                    )
+                spawn_data = r2.json()
+                ctx.session_room_name = spawn_data.get("session_room")
+                log_info(f"Session spawned: {ctx.session_room_name}")
+            await asyncio.sleep(8)
 
         # Build plain text mentions and HTML formatted mentions
         plain_mentions = " ".join(f"@{agent}:local" for agent in agent_handles)
@@ -455,37 +514,18 @@ async def trigger_distributed_negotiation(
             for agent in agent_handles
         )
 
-        # Canonical prompt — mirrors mycelium SKILL.md §"Coordination
-        # Protocol (OpenClaw)" verbatim. Key constraints, learned the
-        # hard way in test_60 and again on the 2026-04-20 distributed
-        # run:
+        # Canonical prompt — mirrors the SKILL.md workflow. Key constraints:
         #   * Tell agents exactly which commands to run (and not run).
-        #   * Pre-create the room/session above so agents don't reach
-        #     for `mycelium room create` or `mycelium session create`.
-        #   * `session join` → return control → (gateway wakes agent
-        #     on tick via the mycelium-room plugin's SSE push path) →
+        #   * Room + session are pre-created above; agents only `session join`.
+        #   * `session join` → return control → gateway wakes agent on tick
+        #     via the mycelium-room channel plugin's SSE push path →
         #     `negotiate respond/propose` → return control → …
-        #     Never `session respond` (doesn't exist).
         #   * **Do NOT instruct agents to run `mycelium session await`.**
-        #     The plugin SKILL is explicit: `session await` is for
-        #     synchronous single-threaded CLI sessions. Inside an
-        #     OpenClaw agent it either (a) blocks the gateway thread
-        #     when run in foreground, or (b) deadlocks behind
-        #     `sessions_yield` when run in background. Either way the
-        #     agent never resumes. The SKILL's contract is push-based:
-        #     CognitiveEngine addresses the agent through the
-        #     mycelium-room channel plugin, which dispatches the tick
-        #     into a new turn and the agent's normal prompt-injection
-        #     flow handles it.
-        #
-        #     CAVEAT: the push path currently requires the channel
-        #     plugin's `cfg.room` to match the test's dynamic room
-        #     name. It doesn't today (plugin is pinned to
-        #     "mycelium_room"), so agents joining a `dist-e2e-<uuid>`
-        #     room will appear silent until we land the per-agent
-        #     room-binding change in the plugin. Stripping
-        #     `session await` from this prompt exposes that bug
-        #     cleanly instead of masking it behind poll deadlocks.
+        #     Inside an OpenClaw agent it blocks the gateway thread or
+        #     deadlocks. The push path handles wakeup.
+        #   * The gateway was restarted above with channels.mycelium-room.room
+        #     pointing at our dynamic room, so the plugin subscribes to
+        #     {room}:session:* and dispatches ticks correctly.
         trigger_msg = f"""Distributed E2E Test: {topic}
 
 {plain_mentions}
@@ -523,8 +563,6 @@ Instructions (run EXACTLY these commands — do NOT run any others):
    the same way. Continue until you receive a consensus message
    (a block starting with `[Mycelium — consensus]`).
 
-5. Report back here with a summary of the consensus.
-
 The room and session are already created — do NOT run `mycelium room create` or `mycelium session create`.
 Briefly explain your reasoning in chat before each CLI command so the human can follow along.
 """
@@ -558,8 +596,6 @@ Please coordinate on the following topic using Mycelium structured negotiation.<
      <code>mycelium negotiate propose ISSUE=VALUE ISSUE=VALUE --room {ctx.mycelium_room_name} --handle &lt;your-handle&gt;</code><br/><br/>
 
 4. After responding, return control again — the next tick will arrive the same way. Continue until you receive a consensus message (a block starting with <code>[Mycelium — consensus]</code>).<br/><br/>
-
-5. Report back here with a summary of the consensus.<br/><br/>
 
 The room and session are already created — do <strong>NOT</strong> run <code>mycelium room create</code> or <code>mycelium session create</code>.<br/>
 Briefly explain your reasoning in chat before each CLI command so the human can follow along.
@@ -613,6 +649,7 @@ async def test_distributed_two_agent(test_ctx: TestContext):
         "Mycelium session created",
         "Coordination consensus reached",
         "Consensus is substantive",
+        "Return-trip message delivered",
     ]
     
     if test_ctx.skip_llm_tests:
@@ -621,10 +658,11 @@ async def test_distributed_two_agent(test_ctx: TestContext):
         return
     
     try:
-        # Trigger the negotiation
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "Sprint Capacity Planning", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -645,20 +683,22 @@ async def test_distributed_two_agent(test_ctx: TestContext):
               error=f"Only {agents_responded}/{len(agents)} agents responded")
         
         # Check for Mycelium session
-        session_exists = False
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            for _ in range(30):
-                r = await http.get(f"{BACKEND_URL}/rooms")
-                rooms = r.json() if r.status_code == 200 else []
-                if any(ctx.mycelium_room_name in rm.get("name", "") for rm in rooms):
-                    session_exists = True
-                    break
-                await asyncio.sleep(2)
+        session_exists = ctx.session_room_name is not None
+        if not session_exists:
+            async with httpx.AsyncClient(timeout=30.0) as http:
+                for _ in range(30):
+                    r = await http.get(f"{BACKEND_URL}/rooms")
+                    rooms = r.json() if r.status_code == 200 else []
+                    if any(ctx.mycelium_room_name in rm.get("name", "") and ":session:" in rm.get("name", "") for rm in rooms):
+                        session_exists = True
+                        break
+                    await asyncio.sleep(2)
         check(test_ctx, "Mycelium session created", session_exists)
         
-        # Wait for consensus
+        # Wait for consensus (use session_room for precise matching)
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Coordination consensus reached", consensus is not None)
         
@@ -671,16 +711,19 @@ async def test_distributed_two_agent(test_ctx: TestContext):
         
         print_convergence_result(consensus, substantive)
         
-        # Post summary back to Matrix room so observers can see the result
-        if consensus and ctx.observer_token and ctx.matrix_room_id:
-            await post_consensus_summary(
-                ctx.observer_token,
-                ctx.matrix_room_id,
-                ctx.mycelium_room_name,
-                agents,
-                consensus,
-                "Sprint Capacity Planning",
+        if consensus:
+            observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
+            return_trips = await wait_for_return_trip_message(
+                observer, ctx.matrix_room_id, agents,
+                timeout_seconds=60, after_timestamp=trigger_ts,
             )
+            await observer.close()
+            any_returned = any(return_trips.values())
+            check(test_ctx, "Return-trip message delivered", any_returned,
+                  error=f"No return-trip messages seen. Status: {return_trips}")
+        else:
+            check(test_ctx, "Return-trip message delivered", False,
+                  skipped=True, skip_reason="No consensus to trigger return-trip")
         
     except Exception as e:
         log_error(f"Test failed: {e}")
@@ -722,6 +765,7 @@ async def test_distributed_three_agent(test_ctx: TestContext):
         "Mycelium session created",
         "Coordination consensus reached",
         "Consensus reflects all positions",
+        "Return-trip message delivered",
     ]
     
     if test_ctx.skip_llm_tests:
@@ -733,6 +777,8 @@ async def test_distributed_three_agent(test_ctx: TestContext):
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "Q2 Release Planning", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -752,21 +798,14 @@ async def test_distributed_three_agent(test_ctx: TestContext):
         check(test_ctx, "All three agents responded", agents_responded == 3,
               error=f"Only {agents_responded}/3 agents responded")
         
-        # Check for Mycelium session
-        session_exists = False
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            for _ in range(30):
-                r = await http.get(f"{BACKEND_URL}/rooms")
-                rooms = r.json() if r.status_code == 200 else []
-                if any(ctx.mycelium_room_name in rm.get("name", "") for rm in rooms):
-                    session_exists = True
-                    break
-                await asyncio.sleep(2)
+        # Session was pre-spawned by trigger_distributed_negotiation
+        session_exists = ctx.session_room_name is not None
         check(test_ctx, "Mycelium session created", session_exists)
         
         # Wait for consensus (see header comment for why 600s, not 240s).
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Coordination consensus reached", consensus is not None)
         
@@ -784,16 +823,19 @@ async def test_distributed_three_agent(test_ctx: TestContext):
         
         print_convergence_result(consensus, reflects_all)
         
-        # Post summary back to Matrix room
-        if consensus and ctx.observer_token and ctx.matrix_room_id:
-            await post_consensus_summary(
-                ctx.observer_token,
-                ctx.matrix_room_id,
-                ctx.mycelium_room_name,
-                agents,
-                consensus,
-                "Q2 Release Planning",
+        if consensus:
+            observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
+            return_trips = await wait_for_return_trip_message(
+                observer, ctx.matrix_room_id, agents,
+                timeout_seconds=60, after_timestamp=trigger_ts,
             )
+            await observer.close()
+            any_returned = any(return_trips.values())
+            check(test_ctx, "Return-trip message delivered", any_returned,
+                  error=f"No return-trip messages seen. Status: {return_trips}")
+        else:
+            check(test_ctx, "Return-trip message delivered", False,
+                  skipped=True, skip_reason="No consensus to trigger return-trip")
         
     except Exception as e:
         log_error(f"Test failed: {e}")
@@ -838,6 +880,8 @@ async def test_distributed_architecture(test_ctx: TestContext):
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "Database Technology Selection", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -864,13 +908,9 @@ async def test_distributed_architecture(test_ctx: TestContext):
         technical_discussion = any(term in all_text for term in tech_terms)
         check(test_ctx, "Technical discussion occurred", technical_discussion)
         
-        # Wait for consensus. Same empirical reasoning as
-        # test_distributed_three_agent: cross-device (oclw4↔oclw5) 2-agent
-        # arch debates were observed still actively ticking at 6m23s with
-        # zero coordination_consensus emitted, so 180s wasn't enough. 600s
-        # is the new ceiling shared with the 3-agent variants.
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Architecture decision reached", consensus is not None)
         
@@ -932,6 +972,8 @@ async def test_distributed_resource_allocation(test_ctx: TestContext):
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "Q3 Budget Allocation", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -957,12 +999,9 @@ async def test_distributed_resource_allocation(test_ctx: TestContext):
         budget_discussion = any(term in all_text for term in budget_terms)
         check(test_ctx, "Budget discussion occurred", budget_discussion)
         
-        # Wait for consensus. 3-agent budget allocation has the same
-        # convergence shape as test_distributed_three_agent (3-way trade-
-        # off across devices), so reuse the same 600s budget — see that
-        # test's header comment for the empirical 8m42s observation.
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Resource allocation reached", consensus is not None)
         
@@ -1034,6 +1073,8 @@ async def test_distributed_asymmetric_stakes(test_ctx: TestContext):
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "API Service Language Selection", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -1058,9 +1099,9 @@ async def test_distributed_asymmetric_stakes(test_ctx: TestContext):
         stakes_acknowledged = any(term in all_text for term in stakes_terms)
         check(test_ctx, "Stakes were acknowledged", stakes_acknowledged)
         
-        # Wait for consensus
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Consensus reached", consensus is not None)
         
@@ -1132,6 +1173,8 @@ async def test_distributed_preexisting_context(test_ctx: TestContext):
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "Mobile Platform Priority (following Q1 mobile-first decision)", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -1156,11 +1199,9 @@ async def test_distributed_preexisting_context(test_ctx: TestContext):
         context_referenced = any(term in all_text for term in context_terms)
         check(test_ctx, "Prior context referenced", context_referenced)
         
-        # Wait for consensus. 2-agent cross-device (oclw4↔oclw5) — same
-        # convergence shape as test_distributed_architecture (test_42), so
-        # reuse 600s. See that test's header comment for empirical detail.
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Decision reached", consensus is not None)
         
@@ -1231,6 +1272,8 @@ async def test_distributed_feature_prioritization(test_ctx: TestContext):
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "Q3 Feature Backlog Prioritization", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -1256,10 +1299,9 @@ async def test_distributed_feature_prioritization(test_ctx: TestContext):
         prio_discussed = any(term in all_text for term in prio_terms)
         check(test_ctx, "Prioritization discussed", prio_discussed)
         
-        # Wait for consensus. 3-agent prioritization — same convergence
-        # shape as test_distributed_three_agent (test_41), so reuse 600s.
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Consensus reached", consensus is not None)
         
@@ -1352,6 +1394,8 @@ async def test_distributed_cross_device_only(test_ctx: TestContext):
         triggered, trigger_ts = await trigger_distributed_negotiation(
             ctx, agents, "Architecture Decision", positions
         )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
         check(test_ctx, "Trigger message sent", triggered)
         
         if not triggered:
@@ -1371,19 +1415,12 @@ async def test_distributed_cross_device_only(test_ctx: TestContext):
         check(test_ctx, "Agents responded in Matrix", agents_responded >= 1,
               error=f"Only {agents_responded}/{len(agents)} agents responded")
         
-        # Verify Mycelium room was created via the backend
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            r = await http.get(f"{BACKEND_URL}/rooms")
-            rooms = r.json() if r.status_code == 200 else []
-            room_exists = any(
-                ctx.mycelium_room_name and ctx.mycelium_room_name in rm.get("name", "") 
-                for rm in rooms
-            ) if ctx.mycelium_room_name else False
-        check(test_ctx, "Mycelium room created", room_exists or ctx.mycelium_room_name is not None)
+        # Session was pre-spawned by trigger_distributed_negotiation
+        check(test_ctx, "Mycelium room created", ctx.session_room_name is not None)
         
-        # Wait for consensus (this is the main success criterion)
         consensus = await wait_for_mycelium_consensus(
-            ctx.mycelium_room_name, timeout_seconds=600
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
         )
         check(test_ctx, "Coordination consensus reached", consensus is not None)
         
@@ -1413,8 +1450,536 @@ async def test_distributed_cross_device_only(test_ctx: TestContext):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Test: Cross-Channel Return-Trip (SKILL.md faithful reproduction)
+#
+# Follows the before-and-after-matrix SKILL.md exactly:
+#   Phase 1g: Create room + bind channel on ALL gateways
+#   Phase 1i: Restart all gateways
+#   Phase 2:  Create DMs per agent, send sanity ping
+#   Phase 3:  Send negotiation prompt to each agent's DM
+#   Phase 4:  Verify return-trip messages land in each DM
+#   Phase 6:  Cleanup — restore configs, restart gateways
+#
+# Three agents across three machines (oclw4, oclw3, oclw5).
+# ─────────────────────────────────────────────────────────────────────────────
+
+REMOTE_HOSTS = {
+    "oclw3": {"ip": OCLW3_IP, "ssh": "oclw3"},
+    "oclw5": {"ip": OCLW5_IP, "ssh": "oclw5"},
+}
+
+SKILL_AGENTS = {
+    "agent-beta":   {"device": "oclw4", "matrix_id": "@agent-beta:local"},
+    "claire-agent":  {"device": "oclw3", "matrix_id": "@claire-agent:local"},
+    "oclw5-agent":   {"device": "oclw5", "matrix_id": "@oclw5-agent:local"},
+}
+
+
+async def _ssh_cmd(host_alias: str, cmd: str, timeout: float = 30.0) -> str:
+    """Run a command on a remote host via SSH."""
+    proc = await asyncio.create_subprocess_exec(
+        "ssh", host_alias, cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise
+    return (stdout or b"").decode().strip()
+
+
+async def _ssh_python(host_alias: str, script: str, timeout: float = 30.0) -> str:
+    """Run a Python script on a remote host via SSH stdin (avoids shell quoting)."""
+    proc = await asyncio.create_subprocess_exec(
+        "ssh", host_alias, "python3", "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=script.encode()), timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise
+    if proc.returncode != 0:
+        err = (stderr or b"").decode().strip()
+        log_warning(f"  _ssh_python on {host_alias} failed: {err}")
+    return (stdout or b"").decode().strip()
+
+
+async def _rebind_remote_mycelium_room(
+    host_alias: str, room_name: str, agents: list[str], backend_url: str,
+) -> None:
+    """Patch openclaw.json on a remote host to bind the channel to a new room."""
+    agents_json = json.dumps(agents)
+    script = f"""
+import json, os
+p = os.path.expanduser('~/.openclaw/openclaw.json')
+cfg = json.load(open(p))
+cfg.setdefault('channels', {{}}).setdefault('mycelium-room', {{}})
+cfg['channels']['mycelium-room']['room'] = {json.dumps(room_name)}
+cfg['channels']['mycelium-room']['enabled'] = True
+cfg['channels']['mycelium-room']['backendUrl'] = {json.dumps(backend_url)}
+cfg['channels']['mycelium-room']['agents'] = {agents_json}
+cfg['channels']['mycelium-room']['requireMention'] = True
+json.dump(cfg, open(p, 'w'), indent=2)
+print('patched')
+"""
+    result = await _ssh_python(host_alias, script)
+    log_info(f"  {host_alias}: {result}")
+
+
+async def _restart_remote_gateway(host_alias: str) -> None:
+    """Restart the OpenClaw gateway on a remote host."""
+    await _ssh_cmd(host_alias, "systemctl --user restart openclaw-gateway", timeout=15.0)
+
+
+async def _restore_remote_mycelium_room(
+    host_alias: str, original_room: str, original_agents: list[str], backend_url: str,
+) -> None:
+    """Restore the original mycelium-room channel config on a remote host."""
+    agents_json = json.dumps(original_agents)
+    script = f"""
+import json, os
+p = os.path.expanduser('~/.openclaw/openclaw.json')
+cfg = json.load(open(p))
+cfg.setdefault('channels', {{}}).setdefault('mycelium-room', {{}})
+cfg['channels']['mycelium-room']['room'] = {json.dumps(original_room)}
+cfg['channels']['mycelium-room']['agents'] = {agents_json}
+cfg['channels']['mycelium-room']['backendUrl'] = {json.dumps(backend_url)}
+cfg['channels']['mycelium-room']['requireMention'] = True
+cfg['channels']['mycelium-room']['enabled'] = True
+json.dump(cfg, open(p, 'w'), indent=2)
+print('restored')
+"""
+    result = await _ssh_python(host_alias, script)
+    log_info(f"  {host_alias}: {result}")
+
+
+async def _get_remote_mycelium_room_config(host_alias: str) -> tuple[str, list[str]]:
+    """Read the current mycelium-room.room and agents from a remote host."""
+    script = """
+import json, os
+p = os.path.expanduser('~/.openclaw/openclaw.json')
+cfg = json.load(open(p))
+mr = cfg.get('channels', {}).get('mycelium-room', {})
+print(json.dumps({'room': mr.get('room',''), 'agents': mr.get('agents',[]), 'backendUrl': mr.get('backendUrl','')}))
+"""
+    raw = await _ssh_python(host_alias, script)
+    data = json.loads(raw)
+    return data["room"], data["agents"]
+
+
+async def _create_dm_with_agent(
+    human_token: str, agent_matrix_id: str,
+) -> str:
+    """Create a DM room between the test-observer and an agent. Returns room_id."""
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        r = await http.post(
+            f"{MATRIX_HOMESERVER}/_matrix/client/v3/createRoom",
+            headers={"Authorization": f"Bearer {human_token}"},
+            json={
+                "is_direct": True,
+                "invite": [agent_matrix_id],
+                "preset": "trusted_private_chat",
+            },
+        )
+        r.raise_for_status()
+        return r.json()["room_id"]
+
+
+async def _wait_for_return_trip_in_dm(
+    token: str,
+    dm_room_id: str,
+    agent_matrix_id: str,
+    timeout_seconds: int = 90,
+    poll_interval: int = 5,
+    after_timestamp: Optional[int] = None,
+) -> bool:
+    """Poll a DM room for the plugin's auto-posted return-trip message."""
+    cutoff_ts = (after_timestamp or 0) - 2000
+    deadline = time.time() + timeout_seconds
+    client = MatrixClient(MATRIX_HOMESERVER, token)
+
+    try:
+        while time.time() < deadline:
+            msgs, _ = await client.read_messages(dm_room_id, limit=15)
+            for msg in msgs:
+                if after_timestamp and msg.get("timestamp", 0) <= cutoff_ts:
+                    continue
+                sender = msg.get("sender", "")
+                body = msg.get("body", "")
+                if sender == agent_matrix_id and "[Mycelium return trip" in body:
+                    log_info(f"Return-trip in DM from {agent_matrix_id}: {body[:80]}...")
+                    return True
+            await asyncio.sleep(poll_interval)
+    finally:
+        await client.close()
+
+    return False
+
+
+async def _get_admin_token() -> str:
+    """Get or create a Synapse admin account for querying any room's messages."""
+    import hmac
+    import hashlib
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(
+            f"{MATRIX_HOMESERVER}/_matrix/client/v3/login",
+            json={"type": "m.login.password", "user": "test-admin", "password": "admin123"},
+        )
+        if r.status_code == 200:
+            return r.json()["access_token"]
+
+        secret = os.environ.get(
+            "MATRIX_SHARED_SECRET",
+            "C&1gRZ#;M2hEp-ehNLtSPeddl^DOutp*Ls4=eDyx_+._^Y#ieY"
+        )
+
+        r = await client.get(f"{MATRIX_HOMESERVER}/_synapse/admin/v1/register")
+        nonce = r.json()["nonce"]
+
+        mac_content = f"{nonce}\x00test-admin\x00admin123\x00admin"
+        mac = hmac.new(secret.encode(), mac_content.encode(), hashlib.sha1).hexdigest()
+
+        r = await client.post(
+            f"{MATRIX_HOMESERVER}/_synapse/admin/v1/register",
+            json={"nonce": nonce, "username": "test-admin", "password": "admin123", "admin": True, "mac": mac},
+        )
+        r.raise_for_status()
+        return r.json()["access_token"]
+
+
+async def _wait_for_return_trip_in_matrix(
+    agent_matrix_id: str,
+    timeout_seconds: int = 90,
+    poll_interval: int = 5,
+    after_timestamp: Optional[int] = None,
+) -> bool:
+    """Poll Matrix rooms (via Synapse admin API) for the plugin's return-trip message."""
+    admin_token = await _get_admin_token()
+    deadline = time.time() + timeout_seconds
+    cutoff_ts = (after_timestamp or 0) - 2000
+
+    while time.time() < deadline:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                headers = {"Authorization": f"Bearer {admin_token}"}
+
+                r = await http.get(
+                    f"{MATRIX_HOMESERVER}/_synapse/admin/v1/users/{quote(agent_matrix_id, safe='')}/joined_rooms",
+                    headers=headers,
+                )
+                if r.status_code != 200:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                rooms = r.json().get("joined_rooms", [])
+
+                for room_id in rooms:
+                    r = await http.get(
+                        f"{MATRIX_HOMESERVER}/_synapse/admin/v1/rooms/{quote(room_id, safe='')}/messages",
+                        headers=headers,
+                        params={"dir": "b", "limit": 20},
+                    )
+                    if r.status_code != 200:
+                        continue
+
+                    for ev in r.json().get("chunk", []):
+                        if ev.get("type") != "m.room.message":
+                            continue
+                        body = ev.get("content", {}).get("body", "")
+                        ts = ev.get("origin_server_ts", 0)
+                        if after_timestamp and ts <= cutoff_ts:
+                            continue
+                        if "[Mycelium return trip" in body:
+                            log_info(f"Return-trip in Matrix for {agent_matrix_id} (room {room_id}): {body[:80]}...")
+                            return True
+        except Exception as exc:
+            log_debug(f"Error polling Matrix for return-trip: {exc}")
+
+        await asyncio.sleep(poll_interval)
+
+    return False
+
+
+async def test_skill_cross_channel_return_trip(test_ctx: TestContext):
+    """
+    Three agents on three devices negotiate via a shared Mycelium room.
+
+    Uses @mentions in the mycelium_room channel (the room all gateways already
+    subscribe to) so the mycelium-room plugin handles dispatch directly.
+    Return-trip messages are delivered back to each agent's home Matrix channel.
+    """
+    print_section(49, "SKILL.md Cross-Channel Return-Trip (3 agents, 3 devices)")
+
+    agents = list(SKILL_AGENTS.keys())
+    topic = "API Design: REST vs GraphQL vs gRPC for the new service layer"
+    positions = {
+        "agent-beta":   "REST primary — stable, cacheable, tooling-rich; GraphQL only for internal dashboards",
+        "claire-agent":  "GraphQL first — single flexible endpoint, eliminates over-fetching, client-driven",
+        "oclw5-agent":   "gRPC for service-to-service, REST for public API — performance where it matters",
+    }
+
+    agents_config = [
+        (a, SKILL_AGENTS[a]["device"], positions[a]) for a in agents
+    ]
+    print_convergence_header("SKILL.md Cross-Channel Return-Trip", agents_config)
+
+    skip_checks = [
+        "Trigger message sent",
+        "Agents responded",
+        "Mycelium session created",
+        "Coordination consensus reached",
+        "Consensus is substantive",
+        "Return-trip: agent-beta",
+        "Return-trip: claire-agent",
+        "Return-trip: oclw5-agent",
+        "Memory stored under correct MAS",
+    ]
+
+    if test_ctx.skip_llm_tests:
+        for name in skip_checks:
+            check(test_ctx, name, False, skipped=True, skip_reason="LLM unavailable")
+        return
+
+    exp_room = f"xch-{uuid.uuid4().hex[:6]}"
+    trigger_ts = 0
+    mas_id = None
+    workspace_id = None
+
+    try:
+        # ── Phase 1: Create Mycelium room ──
+
+        log_info(f"Creating Mycelium room: {exp_room}")
+        proc = await asyncio.create_subprocess_exec(
+            "mycelium", "room", "create", exp_room,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        log_info("Room created (plugin routes by participant_id)")
+
+        # ── Track MAS ID for parent room ──
+        mas_id = None
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.get(f"{BACKEND_URL}/rooms/{exp_room}")
+            if r.status_code == 200:
+                room_data = r.json()
+                mas_id = room_data.get("mas_id")
+                log_info(f"Room {exp_room} mas_id = {mas_id}")
+            else:
+                log_info(f"Room not yet available via API (status {r.status_code})")
+
+        # ── Phase 2: Post prompt to mycelium_room via backend API with @mentions ──
+        # All gateways SSE-subscribe to mycelium_room; the plugin dispatches to
+        # each agent whose handle appears after '@' in the content.
+
+        trigger_ts = int(time.time() * 1000)
+
+        prompt_body = " ".join(f"@{a}:local" for a in agents) + f"""
+
+This is a NEW independent test run. Ignore any prior sessions or test history.
+You MUST execute the commands below — do not skip any step.
+
+Topic: {topic}
+Room: {exp_room}
+
+Each of you has a position:
+- agent-beta: {positions["agent-beta"]}
+- claire-agent: {positions["claire-agent"]}
+- oclw5-agent: {positions["oclw5-agent"]}
+
+Run EXACTLY these commands — do NOT run any others:
+
+1. Join the coordination session as yourself:
+     mycelium session join --handle YOUR_HANDLE --room {exp_room} -m "YOUR_POSITION"
+
+2. Do NOT run mycelium session await. The Mycelium channel plugin wakes you when CognitiveEngine addresses you.
+
+3. When a tick arrives, respond via the CLI:
+     mycelium negotiate respond accept --room {exp_room} --handle YOUR_HANDLE
+   or, only if the tick says can_counter_offer: true:
+     mycelium negotiate propose ISSUE=VALUE ISSUE=VALUE --room {exp_room} --handle YOUR_HANDLE
+
+4. After responding, return control. Continue until the negotiation concludes.
+
+5. The result will be auto-delivered back here by the Mycelium plugin.
+
+Briefly explain your reasoning before each CLI command."""
+
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.post(
+                f"{BACKEND_URL}/rooms/mycelium_room/messages",
+                json={
+                    "content": prompt_body,
+                    "sender_handle": "test-observer",
+                    "message_type": "broadcast",
+                },
+            )
+            if r.status_code == 201:
+                log_info("Prompt posted to mycelium_room via backend API (all gateways will see it)")
+            else:
+                log_info(f"Failed to post prompt: {r.status_code} {r.text[:200]}")
+        check(test_ctx, "Trigger message sent", r.status_code == 201)
+
+        # ── Wait for agent responses (check backend room for agent messages) ──
+
+        log_info("Waiting 30s for agents to respond via mycelium_room...")
+        await asyncio.sleep(30)
+
+        responded = {}
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.get(f"{BACKEND_URL}/rooms/mycelium_room/messages?limit=30")
+            msgs = r.json() if r.status_code == 200 else []
+            if isinstance(msgs, dict):
+                msgs = msgs.get("messages", [])
+
+        for agent in agents:
+            agent_msgs = [
+                m for m in msgs
+                if m.get("sender_handle") == agent
+            ]
+            responded[agent] = len(agent_msgs) > 0
+
+        n_responded = sum(1 for v in responded.values() if v)
+        log_info(f"  {n_responded}/{len(agents)} agents responded: {responded}")
+        check(test_ctx, "Agents responded", n_responded >= 2,
+              error=f"Only {n_responded}/{len(agents)} responded: {responded}")
+
+        # ── Wait for Mycelium session ──
+
+        session_exists = False
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            for _ in range(30):
+                r = await http.get(f"{BACKEND_URL}/rooms")
+                rooms = r.json() if r.status_code == 200 else []
+                if any(exp_room in rm.get("name", "") for rm in rooms):
+                    session_exists = True
+                    break
+                await asyncio.sleep(2)
+        check(test_ctx, "Mycelium session created", session_exists)
+
+        # ── Track MAS ID after session creation ──
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.get(f"{BACKEND_URL}/rooms/{exp_room}")
+            if r.status_code == 200:
+                room_data = r.json()
+                mas_id = room_data.get("mas_id")
+                workspace_id = room_data.get("workspace_id")
+                log_info(f"Room {exp_room}: mas_id={mas_id}, workspace_id={workspace_id}")
+            else:
+                log_info(f"Room API returned {r.status_code}")
+
+        # ── Wait for consensus ──
+
+        consensus = await wait_for_mycelium_consensus(
+            exp_room, timeout_seconds=600
+        )
+        check(test_ctx, "Coordination consensus reached", consensus is not None)
+
+        substantive = False
+        if consensus:
+            plan = str(consensus.get("plan", ""))
+            if len(plan) > 30 and not consensus.get("broken"):
+                substantive = True
+        check(test_ctx, "Consensus is substantive", substantive)
+        print_convergence_result(consensus, substantive)
+
+        # ── Phase 4: Verify return-trip in Matrix ──
+        # The plugin posts return-trip back to the agent's home Matrix channel.
+
+        if consensus:
+            for agent in agents:
+                matrix_id = SKILL_AGENTS[agent]["matrix_id"]
+                got = await _wait_for_return_trip_in_matrix(
+                    matrix_id,
+                    timeout_seconds=90,
+                    after_timestamp=trigger_ts,
+                )
+                check(test_ctx, f"Return-trip: {agent}", got,
+                      error=f"No [Mycelium return trip] from {agent} in Matrix")
+        else:
+            for agent in agents:
+                check(test_ctx, f"Return-trip: {agent}", False,
+                      skipped=True, skip_reason="No consensus")
+
+        # ── Verify MAS ID and memory storage ──
+        if mas_id:
+            log_info(f"Verifying memory stored under mas_id={mas_id}...")
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                # Check session sub-room also has the same mas_id
+                r = await http.get(f"{BACKEND_URL}/rooms")
+                if r.status_code == 200:
+                    all_rooms = r.json()
+                    session_rooms = [
+                        rm for rm in all_rooms
+                        if rm.get("name", "").startswith(f"{exp_room}:session:")
+                    ]
+                    for sr in session_rooms:
+                        sr_mas = sr.get("mas_id")
+                        log_info(f"  Session room {sr['name']}: mas_id={sr_mas}")
+                        if sr_mas and sr_mas != mas_id:
+                            log_warning(f"  MAS ID mismatch! parent={mas_id} session={sr_mas}")
+
+                # Query CFN shared-memories for this MAS
+                if workspace_id:
+                    cfn_url = f"http://localhost:9002/api/workspaces/{workspace_id}/multi-agentic-systems/{mas_id}/shared-memories/query"
+                    r = await http.post(
+                        cfn_url,
+                        json={"intent": f"negotiation in room {exp_room}"},
+                        timeout=30.0,
+                    )
+                    if r.status_code == 200:
+                        mem_data = r.json()
+                        records = mem_data.get("records", [])
+                        log_info(f"  CFN shared-memories query: {len(records)} records for mas_id={mas_id}")
+                        check(test_ctx, "Memory stored under correct MAS", len(records) > 0,
+                              error=f"No records in CFN for mas_id={mas_id}")
+                    else:
+                        log_info(f"  CFN query returned {r.status_code}: {r.text[:200]}")
+                        check(test_ctx, "Memory stored under correct MAS", False,
+                              error=f"CFN query failed: {r.status_code}")
+                else:
+                    check(test_ctx, "Memory stored under correct MAS", False,
+                          error="No workspace_id on room")
+        else:
+            check(test_ctx, "Memory stored under correct MAS", False,
+                  error="No mas_id assigned to room")
+
+    except Exception as e:
+        log_error(f"Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        check(test_ctx, "Test completed without error", False, error=str(e))
+
+    finally:
+        # ── Cleanup: delete the test room ──
+        log_info("Cleaning up...")
+
+        # Delete the test room from backend
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                await http.delete(f"{BACKEND_URL}/rooms/{exp_room}")
+        except Exception:
+            pass
+
+        log_info("Cleanup complete")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Synchronous wrappers for pytest
 # ─────────────────────────────────────────────────────────────────────────────
+
+def skill_cross_channel_return_trip(ctx: TestContext):
+    """Sync wrapper for pytest."""
+    asyncio.run(test_skill_cross_channel_return_trip(ctx))
+
 
 def distributed_two_agent_negotiation(ctx: TestContext):
     """Sync wrapper for pytest."""
@@ -1550,7 +2115,7 @@ async def test_backend_resolved_cfn_ids(test_ctx: TestContext):
             
             log_info("Ingesting from leaf node (oclw3) with room_name only...")
             result = subprocess.run(
-                ["ssh", "oclw3", f"""curl -sf -X POST {BACKEND_URL}/api/knowledge/ingest \
+                ["ssh", "oclw3", f"""curl -sf -X POST {BACKEND_URL}/knowledge/ingest \
                     -H 'Content-Type: application/json' \
                     -d '{ingest_payload}'"""],
                 capture_output=True, text=True, timeout=60
@@ -1589,7 +2154,7 @@ async def test_backend_resolved_cfn_ids(test_ctx: TestContext):
             
             log_info("Testing fallback ingest (no room_name)...")
             # Use subprocess with explicit shell to handle JSON properly
-            ssh_cmd = f'curl -sf -X POST {BACKEND_URL}/api/knowledge/ingest -H "Content-Type: application/json" -d \'{fallback_payload}\''
+            ssh_cmd = f'curl -sf -X POST {BACKEND_URL}/knowledge/ingest -H "Content-Type: application/json" -d \'{fallback_payload}\''
             result = subprocess.run(
                 ["ssh", "oclw3", ssh_cmd],
                 capture_output=True, text=True, timeout=90  # Increased timeout for LLM processing
@@ -1615,7 +2180,7 @@ async def test_backend_resolved_cfn_ids(test_ctx: TestContext):
                 query_payload["mas_id"] = room_mas_id
             
             r = await http.post(
-                f"{BACKEND_URL}/api/cfn/knowledge/query",
+                f"{BACKEND_URL}/cfn/knowledge/query",
                 json=query_payload,
                 timeout=30.0,
             )

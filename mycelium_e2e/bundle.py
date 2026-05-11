@@ -215,6 +215,9 @@ class TestContext:
     matrix_tokens: dict = field(default_factory=dict)
     # Set when CFN has workspaces but backend container has no WORKSPACE_ID — rooms get mas_id=null.
     coordination_blocked_reason: Optional[str] = None
+    # Rooms created during this run — the reaper only deletes rooms in this set
+    # so concurrent runs don't nuke each other's active sessions.
+    _owned_rooms: set = field(default_factory=set)
 
 
 def run_cmd(cmd: list[str], capture: bool = True, timeout: int = 30) -> tuple[int, str, str]:
@@ -238,6 +241,11 @@ def run_cmd(cmd: list[str], capture: bool = True, timeout: int = 30) -> tuple[in
         duration_ms = int((time.time() - start) * 1000)
         log_command(cmd, -1, "", str(e), duration_ms)
         return -1, "", str(e)
+
+
+def register_room(ctx: TestContext, room_name: str) -> None:
+    """Track a room as owned by this test run so the cross-run reaper skips it."""
+    ctx._owned_rooms.add(room_name)
 
 
 def http_get(url: str, timeout: int = 10) -> tuple[int, str]:
@@ -445,18 +453,23 @@ def cli_get_coordination_state(room_name: str) -> Optional[str]:
 # ── Debug helpers for diagnosing negotiation failures ─────────────────────────
 
 
-def capture_backend_logs(lines: int = 50) -> str:
-    """Capture recent backend logs for debugging."""
-    # Use docker logs directly as mycelium logs may have project context issues
+def capture_backend_logs(lines: int = 50, since_minutes: int = 10) -> str:
+    """Capture recent backend logs for debugging.
+
+    Uses ``--since`` instead of just ``--tail`` so that SSE reconnection
+    noise from leaked sessions (#175) doesn't push real log lines out of
+    the capture window.
+    """
+    since = f"{since_minutes}m"
     rc, stdout, stderr = run_cmd(
-        ["docker", "logs", "mycelium-backend", "--tail", str(lines)],
+        ["docker", "logs", "mycelium-backend", "--since", since],
         timeout=30,
     )
-    if rc == 0:
+    if rc == 0 and stdout.strip():
         return stdout
-    # Fallback to mycelium logs
+    # Fallback to tail-based capture with a larger window
     rc, stdout, stderr = run_cmd(
-        ["mycelium", "logs", "mycelium-backend", "--tail", str(lines)],
+        ["docker", "logs", "mycelium-backend", "--tail", str(max(lines, 2000))],
         timeout=30,
     )
     if rc == 0:
@@ -464,18 +477,20 @@ def capture_backend_logs(lines: int = 50) -> str:
     return f"Failed to capture logs: {stderr}"
 
 
-def capture_cfn_logs(lines: int = 50) -> str:
-    """Capture recent CFN node logs for debugging."""
-    # Use docker logs directly as mycelium logs may have project context issues
+def capture_cfn_logs(lines: int = 50, since_minutes: int = 10) -> str:
+    """Capture recent CFN node logs for debugging.
+
+    Uses ``--since`` to avoid the same log-flooding problem as the backend.
+    """
+    since = f"{since_minutes}m"
     rc, stdout, stderr = run_cmd(
-        ["docker", "logs", "ioc-cognition-fabric-node-svc", "--tail", str(lines)],
+        ["docker", "logs", "ioc-cognition-fabric-node-svc", "--since", since],
         timeout=30,
     )
-    if rc == 0:
+    if rc == 0 and stdout.strip():
         return stdout
-    # Fallback to mycelium logs
     rc, stdout, stderr = run_cmd(
-        ["mycelium", "logs", "ioc-cognition-fabric-node-svc", "--tail", str(lines)],
+        ["docker", "logs", "ioc-cognition-fabric-node-svc", "--tail", str(max(lines, 2000))],
         timeout=30,
     )
     if rc == 0:
@@ -684,7 +699,8 @@ def detect_environment(ctx: TestContext):
     print_section(0, "Environment detection")
     
     # Backend health
-    status_code, body = http_get(f"{BACKEND_URL}/health")
+    health_url = BACKEND_URL.replace("/api", "", 1)
+    status_code, body = http_get(f"{health_url}/health")
     if status_code == 200:
         try:
             health = json.loads(body)
@@ -1169,7 +1185,7 @@ def test_ioc_cfn(ctx: TestContext):
     print_section(8, "Knowledge graph (CFN-compatible API)")
 
     # Check if CFN is available by testing the list endpoint
-    status, body = http_get(f"{BACKEND_URL}/api/cfn/knowledge/list?limit=1")
+    status, body = http_get(f"{BACKEND_URL}/cfn/knowledge/list?limit=1")
     if status == 503:
         check(ctx, "Knowledge ingest (room_name)", False, skipped=True, skip_reason="CFN not configured")
         check(ctx, "Knowledge ingest (no room)", False, skipped=True, skip_reason="CFN not configured")
@@ -1179,7 +1195,7 @@ def test_ioc_cfn(ctx: TestContext):
     # Test 1: Ingest with room_name only (leaf node scenario with room context)
     # Backend resolves mas_id from room DB or falls back to settings
     # Note: CFN ingest involves LLM calls for knowledge extraction, so use longer timeout
-    ingest_url = f"{BACKEND_URL}/api/knowledge/ingest"
+    ingest_url = f"{BACKEND_URL}/knowledge/ingest"
     test_marker = f"e2e-test-{uuid.uuid4().hex[:8]}"
     ingest_data = {
         "room_name": ctx.room_name,  # Only room_name, no workspace_id or mas_id
@@ -1244,7 +1260,7 @@ def test_ioc_cfn(ctx: TestContext):
 
     # Test 3: Query endpoint — also doesn't require explicit mas_id
     # Backend resolves from settings.MAS_ID when not provided
-    query_url = f"{BACKEND_URL}/api/cfn/knowledge/query"
+    query_url = f"{BACKEND_URL}/cfn/knowledge/query"
     query_data = {
         "intent": "Find information about weather conditions",
         # No mas_id — backend resolves from settings
@@ -1611,6 +1627,7 @@ def test_consensus_cli_e2e(ctx: TestContext):
     
     # Create a dedicated negotiation room
     nego_room = f"e2e-consensus-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
     
     rc, stdout, stderr = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create negotiation room", rc == 0, error=stderr if rc != 0 else None)
@@ -1732,6 +1749,7 @@ def test_sync_negotiation_cli_e2e(ctx: TestContext):
         return
 
     nego_room = f"e2e-sync-nego-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, stderr = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create sync negotiation room", rc == 0, error=stderr if rc != 0 else None)
@@ -1999,6 +2017,7 @@ def test_demo_script_negotiation_coverage(ctx: TestContext):
         return
 
     nego_room = f"e2e-demo-script-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, stderr = run_cmd(["mycelium", "room", "create", nego_room])
     if rc != 0:
@@ -2362,6 +2381,7 @@ def test_three_agent_negotiation(ctx: TestContext):
         return
 
     nego_room = f"e2e-three-agent-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, stderr = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create three-agent room", rc == 0, error=stderr if rc != 0 else None)
@@ -2531,6 +2551,7 @@ def test_architecture_decision(ctx: TestContext):
         return
 
     nego_room = f"e2e-arch-decision-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, stderr = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create architecture room", rc == 0, error=stderr if rc != 0 else None)
@@ -2680,6 +2701,7 @@ def test_resource_allocation(ctx: TestContext):
         return
 
     nego_room = f"e2e-resource-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, stderr = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create resource room", rc == 0, error=stderr if rc != 0 else None)
@@ -2823,6 +2845,7 @@ def test_asymmetric_stakes(ctx: TestContext):
         return
 
     nego_room = f"e2e-asymmetric-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, _ = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create asymmetric room", rc == 0)
@@ -2978,6 +3001,7 @@ def test_preexisting_context(ctx: TestContext):
         return
 
     nego_room = f"e2e-context-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, _ = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create context room", rc == 0)
@@ -3139,6 +3163,7 @@ def test_feature_prioritization(ctx: TestContext):
         return
 
     nego_room = f"e2e-priority-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, _ = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create prioritization room", rc == 0)
@@ -3278,6 +3303,7 @@ def test_consensus_stability(ctx: TestContext):
         return
 
     nego_room = f"e2e-stability-{uuid.uuid4().hex[:8]}"
+    register_room(ctx, nego_room)
 
     rc, _, _ = run_cmd(["mycelium", "room", "create", nego_room])
     check(ctx, "Create stability room", rc == 0)
@@ -3868,10 +3894,11 @@ def cleanup_distributed(
     
     print(f"{DIM}Cleaning up distributed test environment...{RESET}")
     
-    # Step 1: Clean stale sessions from backend
-    print(f"{DIM}  Cleaning stale backend sessions...{RESET}")
-    sessions_cleaned = cleanup_stale_sessions(prefix="e2e-")
-    sessions_cleaned += cleanup_stale_sessions(prefix="dist-e2e-")
+    # Step 1: Clean stale sessions from backend — only old ones (>10min)
+    # to avoid interfering with concurrent runs.
+    print(f"{DIM}  Cleaning stale backend sessions (>10min old)...{RESET}")
+    sessions_cleaned = cleanup_stale_sessions(prefix="e2e-", max_age_minutes=10)
+    sessions_cleaned += cleanup_stale_sessions(prefix="dist-e2e-", max_age_minutes=10)
     if sessions_cleaned > 0:
         print(f"{DIM}  Cleaned {sessions_cleaned} stale session(s){RESET}")
     
@@ -3920,12 +3947,18 @@ def cleanup(ctx: TestContext):
     log_info(f"Cleaning up room {ctx.room_name}")
     run_cmd(["mycelium", "room", "delete", ctx.room_name, "--force"])
     
-    # Also clean up any stale e2e sessions
-    print(f"{DIM}Cleaning up stale e2e sessions...{RESET}")
-    cleaned = cleanup_stale_sessions(prefix="e2e-")
-    cleaned += cleanup_stale_sessions(prefix="dist-e2e-")
-    if cleaned > 0:
-        print(f"{DIM}Cleaned up {cleaned} stale session(s){RESET}")
+    # Clean up rooms owned by this run only — avoids nuking a concurrent run's
+    # active sessions (root cause of the 404-mid-negotiation failures).
+    if ctx._owned_rooms:
+        print(f"{DIM}Cleaning up {len(ctx._owned_rooms)} owned room(s)...{RESET}")
+        cleaned = 0
+        for room_name in list(ctx._owned_rooms):
+            encoded = urllib.parse.quote(room_name, safe="")
+            del_status, _ = http_delete(f"{BACKEND_URL}/rooms/{encoded}")
+            if del_status in (200, 204):
+                cleaned += 1
+        if cleaned > 0:
+            print(f"{DIM}Cleaned up {cleaned} owned room(s){RESET}")
 
 
 def print_results(ctx: TestContext):
