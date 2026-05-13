@@ -381,18 +381,24 @@ def fetch_room_messages(room_name: str, timeout: int = 15) -> tuple[int, list]:
 
 
 def find_session_room(parent_namespace: str) -> Optional[str]:
-    """Return the child session room name under parent_namespace (namespace room)."""
-    status, body = http_get(f"{BACKEND_URL}/rooms?limit=200", timeout=15)
+    """Return the display_name of an active coordination session under *parent_namespace*.
+
+    Queries ``GET /coordination-sessions?parent_room=…`` which is backed by
+    the ``coordination_sessions`` table (sessions do NOT appear in ``rooms``).
+    """
+    enc = urllib.parse.quote(parent_namespace, safe="")
+    status, body = http_get(
+        f"{BACKEND_URL}/coordination-sessions?parent_room={enc}&limit=1", timeout=15
+    )
     if status != 200:
         return None
     try:
-        rooms = json.loads(body)
-        if not isinstance(rooms, list):
+        sessions = json.loads(body)
+        if not isinstance(sessions, list):
             return None
-        for r in rooms:
-            name = r.get("name") or ""
-            if r.get("parent_namespace") == parent_namespace and ":session:" in name:
-                return name
+        for s in sessions:
+            if s.get("state") not in ("complete", "failed"):
+                return s.get("display_name")
     except (json.JSONDecodeError, TypeError):
         pass
     return None
@@ -429,19 +435,23 @@ def cli_get_room_info(room_name: str) -> Optional[dict]:
 
 
 def cli_find_session_room(parent_namespace: str) -> Optional[str]:
-    """Use 'mycelium --json room ls' to find session child room (avoids HTTP)."""
-    rc, stdout, _ = run_cmd(["mycelium", "--json", "room", "ls"], timeout=15)
-    if rc != 0:
-        return None
+    """Find session room via the coordination-sessions API (sessions are NOT in the rooms table).
+
+    Falls back to ``find_session_room()`` which hits the same endpoint over HTTP.
+    """
+    return find_session_room(parent_namespace)
+
+
+def _parse_session_room(session_create_stdout: str, parent_room: str) -> Optional[str]:
+    """Extract ``session_room`` (display_name) from ``mycelium --json session create`` output.
+
+    Returns *None* if parsing fails so callers can fall back to the polling loop.
+    """
     try:
-        rooms = json.loads(stdout)
-        for r in rooms:
-            name = r.get("name") or ""
-            if r.get("parent_namespace") == parent_namespace and ":session:" in name:
-                return name
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return None
+        data = json.loads(session_create_stdout)
+        return data.get("session_room") or data.get("display_name")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 def cli_get_coordination_state(room_name: str) -> Optional[str]:
@@ -1028,9 +1038,20 @@ def test_consensus_negotiation(ctx: TestContext):
 # committed to source control. Set MATRIX_TOKEN_<AGENT> (uppercase, hyphens
 # replaced with underscores), e.g. MATRIX_TOKEN_AGENT_ALPHA. Tokens can be
 # rotated with scripts/refresh-matrix-tokens.sh.
+_OPENCLAW_JSON = os.path.expanduser("~/.openclaw/openclaw.json")
+
+
 def _matrix_token(agent: str) -> str:
     env_var = "MATRIX_TOKEN_" + agent.upper().replace("-", "_")
-    return os.environ.get(env_var, "")
+    token = os.environ.get(env_var, "")
+    if token:
+        return token
+    try:
+        with open(_OPENCLAW_JSON) as f:
+            cfg = json.load(f)
+        return cfg["channels"]["matrix"]["accounts"][agent]["accessToken"]
+    except (FileNotFoundError, KeyError, json.JSONDecodeError, TypeError):
+        return ""
 
 
 MATRIX_AGENTS = {
@@ -1772,7 +1793,7 @@ def test_sync_negotiation_cli_e2e(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    rc, _, stderr = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, stderr = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     session_ok = rc == 0
     check(ctx, "Session created", session_ok, error=stderr.strip() if not session_ok else None)
     if not session_ok:
@@ -1780,6 +1801,8 @@ def test_sync_negotiation_cli_e2e(ctx: TestContext):
             check(ctx, name, False, skipped=True, skip_reason="Session create failed")
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
+
+    session_room = _parse_session_room(stdout, nego_room)
 
     run_cmd([
         "mycelium", "session", "join",
@@ -1794,13 +1817,12 @@ def test_sync_negotiation_cli_e2e(ctx: TestContext):
         "--message", "I want premium quality and a flexible timeline.",
     ])
 
-    # Resolve session sub-room using CLI (avoids HTTP)
-    session_room: Optional[str] = None
-    for _attempt in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _attempt in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
     check(ctx, "Session room resolved (CLI)", session_room is not None,
           error="Could not find session child room under namespace" if not session_room else None)
     if not session_room:
@@ -2047,12 +2069,14 @@ def test_demo_script_negotiation_coverage(ctx: TestContext):
     )
     check(ctx, "mycelium watch exits (timeout)", rc == 0, error=stderr.strip() if rc != 0 else None)
 
-    rc, _, stderr = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, stderr = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     if rc != 0:
         for name in skip_all[1:]:
             check(ctx, name, False, skipped=True, skip_reason=f"Session create failed: {stderr.strip()}")
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
+
+    session_room = _parse_session_room(stdout, nego_room)
 
     run_cmd([
         "mycelium", "session", "join",
@@ -2067,13 +2091,12 @@ def test_demo_script_negotiation_coverage(ctx: TestContext):
         "--message", "Focus on demo UX and polish — backend is solid enough.",
     ])
 
-    # Resolve session room using CLI (avoids HTTP)
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
     
     check(ctx, "Session room resolved (CLI)", session_room is not None,
           error="Could not find session child room" if not session_room else None)
@@ -2400,7 +2423,7 @@ def test_three_agent_negotiation(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    rc, _, stderr = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, stderr = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     check(ctx, "Session created", rc == 0, error=stderr if rc != 0 else None)
     if rc != 0:
         for name in skip_names[3:]:
@@ -2408,7 +2431,8 @@ def test_three_agent_negotiation(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    # Join agents with their positions
+    session_room = _parse_session_room(stdout, nego_room)
+
     for handle, _, message in agents_config:
         run_cmd([
             "mycelium", "session", "join",
@@ -2419,12 +2443,12 @@ def test_three_agent_negotiation(ctx: TestContext):
     
     check(ctx, "All three agents joined", True)
 
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
     check(ctx, "Session room resolved", session_room is not None,
           error="No session room" if not session_room else None)
     if not session_room:
@@ -2570,7 +2594,7 @@ def test_architecture_decision(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    rc, _, _ = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, _ = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     check(ctx, "Session created", rc == 0)
     if rc != 0:
         for name in skip_names[3:]:
@@ -2578,7 +2602,8 @@ def test_architecture_decision(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    # Join agents with their technical positions
+    session_room = _parse_session_room(stdout, nego_room)
+
     for handle, _, message in agents_config:
         run_cmd([
             "mycelium", "session", "join",
@@ -2588,12 +2613,12 @@ def test_architecture_decision(ctx: TestContext):
         ])
     check(ctx, "Agents joined with technical positions", True)
 
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
 
     tick_seen = False
     if session_room:
@@ -2719,13 +2744,15 @@ def test_resource_allocation(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    rc, _, _ = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, _ = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     check(ctx, "Session created", rc == 0)
     if rc != 0:
         for name in skip_names[3:]:
             check(ctx, name, False, skipped=True, skip_reason="Session failed")
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
+
+    session_room = _parse_session_room(stdout, nego_room)
 
     for handle, _, message in agents_config:
         run_cmd([
@@ -2736,12 +2763,12 @@ def test_resource_allocation(ctx: TestContext):
         ])
     check(ctx, "Agents joined with resource demands", True)
 
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
 
     tick_seen = False
     if session_room:
@@ -2863,7 +2890,7 @@ def test_asymmetric_stakes(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    rc, _, _ = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, _ = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     check(ctx, "Session created", rc == 0)
     if rc != 0:
         for name in skip_names[3:]:
@@ -2871,7 +2898,8 @@ def test_asymmetric_stakes(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    # Join agents with their stake levels
+    session_room = _parse_session_room(stdout, nego_room)
+
     for handle, _, message in agents_config:
         run_cmd([
             "mycelium", "session", "join",
@@ -2881,12 +2909,12 @@ def test_asymmetric_stakes(ctx: TestContext):
         ])
     check(ctx, "Agents joined (one critical, one flexible)", True)
 
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
 
     tick_seen = False
     if session_room:
@@ -3036,7 +3064,7 @@ def test_preexisting_context(ctx: TestContext):
             all_stored = False
     check(ctx, "Prior decisions stored", all_stored)
 
-    rc, _, _ = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, _ = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     check(ctx, "Session created", rc == 0)
     if rc != 0:
         for name in skip_names[4:]:
@@ -3044,7 +3072,8 @@ def test_preexisting_context(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    # Join agents who reference prior context
+    session_room = _parse_session_room(stdout, nego_room)
+
     for handle, _, message in agents_config:
         run_cmd([
             "mycelium", "session", "join",
@@ -3054,12 +3083,12 @@ def test_preexisting_context(ctx: TestContext):
         ])
     check(ctx, "Agents reference prior decisions", True)
 
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
 
     tick_seen = False
     if session_room:
@@ -3181,7 +3210,7 @@ def test_feature_prioritization(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    rc, _, _ = run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, _ = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
     check(ctx, "Session created", rc == 0)
     if rc != 0:
         for name in skip_names[3:]:
@@ -3189,7 +3218,8 @@ def test_feature_prioritization(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    # Join agents with their priority lists
+    session_room = _parse_session_room(stdout, nego_room)
+
     for handle, _, message in agents_config:
         run_cmd([
             "mycelium", "session", "join",
@@ -3199,12 +3229,12 @@ def test_feature_prioritization(ctx: TestContext):
         ])
     check(ctx, "Agents joined with feature preferences", True)
 
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
 
     tick_seen = False
     if session_room:
@@ -3321,8 +3351,9 @@ def test_consensus_stability(ctx: TestContext):
         run_cmd(["mycelium", "room", "delete", nego_room, "--force"])
         return
 
-    # Run initial negotiation
-    run_cmd(["mycelium", "session", "create", "--room", nego_room])
+    rc, stdout, _ = run_cmd(["mycelium", "--json", "session", "create", "--room", nego_room])
+    session_room = _parse_session_room(stdout, nego_room) if rc == 0 else None
+
     for handle, _, message in agents_config:
         run_cmd([
             "mycelium", "session", "join", "--room", nego_room,
@@ -3330,12 +3361,12 @@ def test_consensus_stability(ctx: TestContext):
             "--message", message,
         ])
 
-    session_room: Optional[str] = None
-    for _ in range(20):
-        time.sleep(0.5)
-        session_room = cli_find_session_room(nego_room)
-        if session_room:
-            break
+    if not session_room:
+        for _ in range(20):
+            time.sleep(0.5)
+            session_room = cli_find_session_room(nego_room)
+            if session_room:
+                break
 
     # Wait for tick and respond
     consensus_reached = False
