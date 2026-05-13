@@ -214,60 +214,82 @@ async def get_or_create_test_room(observer_token: str, agent_handles: list[str])
     return DISTRIBUTED_TEST_ROOM, DISTRIBUTED_TEST_ROOM_ID
 
 
-async def wait_for_agent_responses(
-    client: MatrixClient,
-    room_id: str,
+async def wait_for_negotiation_responses(
+    session_room: Optional[str],
     expected_agents: list[str],
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 180,
     poll_interval: int = 5,
-    after_timestamp: Optional[int] = None,
 ) -> dict[str, list[str]]:
     """
-    Wait for agents to respond in the Matrix room.
-    
-    Args:
-        after_timestamp: Only consider messages with origin_server_ts > this value.
-                        If None, uses current time in milliseconds.
-    
-    Returns a dict mapping agent handle to list of their message bodies.
+    Wait for agents to participate in a CFN negotiation by polling the
+    backend session room's message stream.
+
+    This is the **authoritative** "did the agents respond?" check for
+    distributed/Mycelium-channel tests:
+
+    * Agents reply via ``mycelium negotiate respond/propose``, which posts
+      a ``direct`` message into the session sub-room (e.g.
+      ``mycelium_room:session:abc123``). They do NOT reply on Matrix —
+      the Matrix room is only used for the initial trigger and an
+      explicit return-trip post at the end of the negotiation. Polling
+      Matrix for replies registers a false negative.
+    * Session-room messages carry both the ``sender_handle`` (proves the
+      agent acted) and the JSON ``content`` payload (carries the agent's
+      action, positions, and rationale — used by content-aware checks
+      like "Technical discussion occurred").
+
+    Returns a dict mapping agent handle → list of message ``content``
+    strings (typically JSON-encoded reply payloads). An empty list means
+    the agent never wrote to the session room within the timeout.
     """
     responses: dict[str, list[str]] = {agent: [] for agent in expected_agents}
+    if not session_room:
+        log_warning("wait_for_negotiation_responses: no session_room provided")
+        return responses
+
     start = time.time()
-    seen_events: set[str] = set()
-    
-    # Only consider messages after this timestamp (filter out history)
-    cutoff_ts = after_timestamp if after_timestamp else int(time.time() * 1000)
-    
-    while time.time() - start < timeout_seconds:
-        messages, _ = await client.read_messages(room_id, limit=100)
-        
-        for msg in messages:
-            event_id = msg.get("event_id", "")
-            if event_id in seen_events:
+    seen_ids: set[str] = set()
+    async with httpx.AsyncClient(timeout=10.0) as http:
+        while time.time() - start < timeout_seconds:
+            try:
+                r = await http.get(
+                    f"{BACKEND_URL}/rooms/{quote(session_room, safe='')}/messages",
+                    params={"limit": 200},
+                )
+            except Exception as exc:
+                log_debug(f"session-room fetch failed: {exc}")
+                await asyncio.sleep(poll_interval)
                 continue
-            seen_events.add(event_id)
-            
-            # Skip messages before our cutoff
-            msg_ts = msg.get("timestamp", 0)
-            if msg_ts <= cutoff_ts:
-                continue
-            
-            sender = msg.get("sender", "")
-            body = msg.get("body", "")
-            
-            for agent in expected_agents:
-                if f"@{agent}:local" == sender or agent in sender:
-                    responses[agent].append(body)
-                    log_debug(f"Agent {agent} responded: {body[:100]}...")
-        
-        # Check if all agents have responded at least once
-        if all(len(msgs) > 0 for msgs in responses.values()):
-            log_info(f"All {len(expected_agents)} agents have responded")
-            return responses
-        
-        await asyncio.sleep(poll_interval)
-    
-    log_warning(f"Timeout waiting for agents. Responses: {[(k, len(v)) for k, v in responses.items()]}")
+
+            if r.status_code == 200:
+                for msg in r.json().get("messages", []):
+                    mid = msg.get("id")
+                    if mid is None or mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    if msg.get("message_type") != "direct":
+                        continue
+                    handle = msg.get("sender_handle")
+                    if handle in responses:
+                        responses[handle].append(msg.get("content") or "")
+                        log_debug(
+                            f"Agent {handle} replied in session room: "
+                            f"{(msg.get('content') or '')[:120]}"
+                        )
+
+            if all(responses[a] for a in expected_agents):
+                log_info(
+                    f"All {len(expected_agents)} agents have replied in {session_room} "
+                    f"({sum(len(v) for v in responses.values())} message(s) total)"
+                )
+                return responses
+
+            await asyncio.sleep(poll_interval)
+
+    log_warning(
+        "Timeout waiting for negotiation responses. Replies: "
+        f"{[(k, len(v)) for k, v in responses.items()]}"
+    )
     return responses
 
 
@@ -645,7 +667,7 @@ async def test_distributed_two_agent(test_ctx: TestContext):
     
     skip_checks = [
         "Trigger message sent",
-        "Agents responded in Matrix",
+        "Agents responded",
         "Mycelium session created",
         "Coordination consensus reached",
         "Consensus is substantive",
@@ -670,18 +692,18 @@ async def test_distributed_two_agent(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for agent responses in Matrix (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=120,
-            after_timestamp=trigger_ts
+        # Wait for agent responses via the CFN round-trace ring buffer.
+        # Agents reply with `mycelium negotiate respond/propose` which posts
+        # to the backend session room, NOT to the Matrix observer room, so
+        # observing Matrix here used to register a false negative.
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=120
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
-        check(test_ctx, "Agents responded in Matrix", agents_responded >= 1,
+        check(test_ctx, "Agents responded", agents_responded >= 1,
               error=f"Only {agents_responded}/{len(agents)} agents responded")
-        
+
         # Check for Mycelium session
         session_exists = ctx.session_room_name is not None
         if not session_exists:
@@ -786,14 +808,12 @@ async def test_distributed_three_agent(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for agent responses (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=180,
-            after_timestamp=trigger_ts
+        # Wait for agent responses via the CFN round-trace ring buffer
+        # (Mycelium-channel replies; see wait_for_negotiation_responses).
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=180
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
         check(test_ctx, "All three agents responded", agents_responded == 3,
               error=f"Only {agents_responded}/3 agents responded")
@@ -889,14 +909,12 @@ async def test_distributed_architecture(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for responses (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=120,
-            after_timestamp=trigger_ts
+        # Wait for agent replies in the backend session room
+        # (see wait_for_negotiation_responses for why we don't poll Matrix).
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=120
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
         check(test_ctx, "Agents responded", agents_responded >= 1)
         
@@ -981,14 +999,12 @@ async def test_distributed_resource_allocation(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for agent responses (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=180,
-            after_timestamp=trigger_ts
+        # Wait for agent replies in the backend session room
+        # (see wait_for_negotiation_responses for why we don't poll Matrix).
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=180
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
         check(test_ctx, "All agents responded", agents_responded == 3,
               error=f"Only {agents_responded}/3 agents responded")
@@ -1082,14 +1098,12 @@ async def test_distributed_asymmetric_stakes(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for responses (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=120,
-            after_timestamp=trigger_ts
+        # Wait for agent replies in the backend session room
+        # (see wait_for_negotiation_responses for why we don't poll Matrix).
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=120
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
         check(test_ctx, "Agents responded", agents_responded >= 1)
         
@@ -1182,14 +1196,12 @@ async def test_distributed_preexisting_context(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for responses (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=120,
-            after_timestamp=trigger_ts
+        # Wait for agent replies in the backend session room
+        # (see wait_for_negotiation_responses for why we don't poll Matrix).
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=120
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
         check(test_ctx, "Agents responded", agents_responded >= 1)
         
@@ -1281,14 +1293,12 @@ async def test_distributed_feature_prioritization(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for agent responses (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=180,
-            after_timestamp=trigger_ts
+        # Wait for agent replies in the backend session room
+        # (see wait_for_negotiation_responses for why we don't poll Matrix).
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=180
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
         check(test_ctx, "All agents responded", agents_responded == 3,
               error=f"Only {agents_responded}/3 agents responded")
@@ -1372,7 +1382,7 @@ async def test_distributed_cross_device_only(test_ctx: TestContext):
     
     skip_checks = [
         "Trigger message sent",
-        "Agents responded in Matrix",
+        "Agents responded",
         "Mycelium room created",
         "Coordination consensus reached",
         "Consensus is substantive",
@@ -1403,16 +1413,14 @@ async def test_distributed_cross_device_only(test_ctx: TestContext):
                 check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
             return
         
-        # Wait for agent responses in Matrix (only messages after trigger)
-        observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
-        responses = await wait_for_agent_responses(
-            observer, ctx.matrix_room_id, agents, timeout_seconds=120,
-            after_timestamp=trigger_ts
+        # Wait for agent replies in the backend session room
+        # (see wait_for_negotiation_responses for why we don't poll Matrix).
+        responses = await wait_for_negotiation_responses(
+            ctx.session_room_name, agents, timeout_seconds=120
         )
-        await observer.close()
-        
+
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
-        check(test_ctx, "Agents responded in Matrix", agents_responded >= 1,
+        check(test_ctx, "Agents responded", agents_responded >= 1,
               error=f"Only {agents_responded}/{len(agents)} agents responded")
         
         # Session was pre-spawned by trigger_distributed_negotiation
