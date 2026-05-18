@@ -1031,6 +1031,219 @@ def test_consensus_negotiation(ctx: TestContext):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Section 6b: Session join idempotency (regression coverage for #280, #284)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# PR #286 hardened `_spawn_coordination_session` (DB unique indexes + PG
+# advisory lock) and made `join_room` idempotent so that:
+#   #280 — concurrent first-joins can't fork the room into multiple
+#          CoordinationSessions.
+#   #284 — a handle calling `session join` twice (e.g. once via the harness
+#          and once via the agent following SKILL.md) doesn't double-count
+#          participants, which previously broke NegMAS quorum at 2N.
+#
+# We assert on the public surfaces (CLI return code + GET /api/sessions and
+# GET /api/sessions/coordination) so the check fails loudly if either fix
+# is reverted in the backend OR the plugin.
+
+
+def _count_coord_sessions(room_name: str) -> int:
+    """Return the number of CoordinationSession rows for a parent room.
+
+    The sessions router is mounted under /api/rooms/{room_name}/sessions
+    (see fastapi-backend/app/routes/sessions.py: prefix='/rooms/{room_name}/sessions').
+    """
+    code, body = http_get(f"{BACKEND_URL}/rooms/{room_name}/sessions/coordination")
+    if code != 200:
+        return -1
+    try:
+        return len(json.loads(body))
+    except (json.JSONDecodeError, TypeError):
+        return -1
+
+
+def _count_distinct_participants(room_name: str) -> tuple[int, int]:
+    """Return (total_participants, distinct_handles) for a parent room."""
+    code, body = http_get(f"{BACKEND_URL}/rooms/{room_name}/sessions")
+    if code != 200:
+        return -1, -1
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return -1, -1
+    parts = data.get("participants") or []
+    handles = {p.get("agent_handle") for p in parts if p.get("agent_handle")}
+    return len(parts), len(handles)
+
+
+def test_session_join_idempotency(ctx: TestContext):
+    """Regression coverage for #280 (no session fork) + #284 (no participant dup).
+
+    Two-phase test:
+      Phase A — sequential dup-join: same handle calls ``session join`` twice
+                in the same room. Both calls succeed; participants table holds
+                ONE row for that handle, not two.
+      Phase B — concurrent first-joins: two different handles join the same
+                brand-new room simultaneously. Exactly ONE CoordinationSession
+                exists for that room afterwards.
+
+    Expected baseline: backend at or after PR #286
+    (commit ``fix(coord): session join idempotency + collapse dual tick
+    representations``). On older backends Phase A will fail with
+    ``total=2 distinct=1`` and Phase B will occasionally fail with multiple
+    CoordinationSessions for the same parent room — both are real bugs the
+    fix was designed to prevent.
+    """
+    print_section(62, "Session join idempotency (#280, #284)")
+
+    # ── Phase A: sequential dup-join ───────────────────────────────────────
+    room_a = f"{ctx.room_name}-idem-a"
+    rc, _, stderr = run_cmd(["mycelium", "room", "create", room_a])
+    check(ctx, "Idem-A: create room", rc == 0, error=stderr if rc != 0 else None)
+    if rc != 0:
+        for name in ["Idem-A: first join", "Idem-A: second join (dup)",
+                     "Idem-A: one participant row per handle"]:
+            check(ctx, name, False, skipped=True, skip_reason="Room create failed")
+    else:
+        register_room(ctx, room_a)
+        run_cmd(["mycelium", "session", "create", "--room", room_a])
+
+        rc1, _, e1 = run_cmd([
+            "mycelium", "session", "join",
+            "--room", room_a, "--handle", "agent-dup",
+            "--message", "first join",
+        ])
+        check(ctx, "Idem-A: first join", rc1 == 0, error=e1 if rc1 != 0 else None)
+
+        rc2, _, e2 = run_cmd([
+            "mycelium", "session", "join",
+            "--room", room_a, "--handle", "agent-dup",
+            "--message", "second join (dup)",
+        ])
+        # PR #286 made this idempotent; pre-fix this either errored or
+        # silently inserted a second Participant row.
+        check(ctx, "Idem-A: second join (dup)", rc2 == 0, error=e2 if rc2 != 0 else None)
+
+        total, distinct = _count_distinct_participants(room_a)
+        ok = total == distinct == 1
+        check(
+            ctx,
+            "Idem-A: one participant row per handle",
+            ok,
+            error=f"expected 1 participant for 1 handle, got total={total} distinct={distinct}"
+            if not ok else None,
+        )
+
+        run_cmd(["mycelium", "room", "delete", room_a, "--force"])
+
+    # ── Phase B: concurrent first-joins ────────────────────────────────────
+    room_b = f"{ctx.room_name}-idem-b"
+    rc, _, stderr = run_cmd(["mycelium", "room", "create", room_b])
+    check(ctx, "Idem-B: create room", rc == 0, error=stderr if rc != 0 else None)
+    if rc != 0:
+        for name in ["Idem-B: both joins succeed",
+                     "Idem-B: exactly one coordination session"]:
+            check(ctx, name, False, skipped=True, skip_reason="Room create failed")
+        return
+
+    register_room(ctx, room_b)
+    # Intentionally DON'T pre-create a session — the goal is to race two
+    # session-spawning joins. Each thread submits the join and stashes its
+    # return code so the test thread can assert on both.
+    import threading
+
+    results: dict[str, tuple[int, str]] = {}
+
+    def _join(handle: str) -> None:
+        rc, _, err = run_cmd([
+            "mycelium", "session", "join",
+            "--room", room_b, "--handle", handle,
+            "--message", f"{handle} position",
+        ])
+        results[handle] = (rc, err)
+
+    t1 = threading.Thread(target=_join, args=("agent-race-a",))
+    t2 = threading.Thread(target=_join, args=("agent-race-b",))
+    t1.start(); t2.start()
+    t1.join(timeout=60); t2.join(timeout=60)
+
+    rc_a, err_a = results.get("agent-race-a", (-1, "thread did not finish"))
+    rc_b, err_b = results.get("agent-race-b", (-1, "thread did not finish"))
+    both_ok = rc_a == 0 and rc_b == 0
+    check(
+        ctx,
+        "Idem-B: both joins succeed",
+        both_ok,
+        error=f"agent-race-a: rc={rc_a} {err_a}\nagent-race-b: rc={rc_b} {err_b}"
+        if not both_ok else None,
+    )
+
+    n_sessions = _count_coord_sessions(room_b)
+    check(
+        ctx,
+        "Idem-B: exactly one coordination session",
+        n_sessions == 1,
+        error=f"expected 1 CoordinationSession for {room_b}, got {n_sessions}"
+        if n_sessions != 1 else None,
+    )
+
+    run_cmd(["mycelium", "room", "delete", room_b, "--force"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 6c: `mycelium doctor` is clean (PR #273)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_doctor_clean(ctx: TestContext):
+    """Run `mycelium doctor --json` and fail the suite on any non-ok check.
+
+    Catches stale alembic migrations (PR #273), drifted adapter manifests,
+    misaligned config files, etc. — silent breakage classes that otherwise
+    surface as confusing downstream test failures.
+    """
+    print_section(63, "mycelium doctor clean")
+
+    # --json is a global flag (mycelium --json doctor), not a doctor subflag.
+    rc, stdout, stderr = run_cmd(["mycelium", "--json", "doctor"], timeout=60)
+    # doctor exits non-zero on hard errors; warnings still exit 0. We parse
+    # the JSON either way so warnings are visible in the e2e report.
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        check(
+            ctx,
+            "doctor: JSON parses",
+            False,
+            error=f"doctor exited {rc}, stdout was not JSON.\nstderr: {stderr[:500]}",
+        )
+        return
+    check(ctx, "doctor: JSON parses", True)
+
+    checks = data.get("checks") or []
+    errors = [c for c in checks if c.get("status") in ("error", "unreachable", "missing_extras", "bad_model")]
+    warnings = [c for c in checks if c.get("status") == "warning"]
+
+    err_lines = [f"  ✗ {c.get('name')}: {c.get('message')}" for c in errors]
+    warn_lines = [f"  ~ {c.get('name')}: {c.get('message')}" for c in warnings]
+
+    check(
+        ctx,
+        "doctor: no error-level checks",
+        not errors,
+        error="\n".join(err_lines) if errors else None,
+    )
+    # Warnings are informational — surface them but don't fail.
+    check(
+        ctx,
+        "doctor: warnings (informational)",
+        True,
+        skipped=bool(warnings),
+        skip_reason="\n".join(warn_lines) if warnings else None,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Section 7: Matrix Agent Communication
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2124,6 +2337,24 @@ def test_demo_script_negotiation_coverage(ctx: TestContext):
         tick_seen,
         error="No coordination_tick within 240s" if not tick_seen else None,
     )
+
+    # PR #286 (#285): canonical issue keys MUST be present in the tick payload
+    # so the plugin can render `Valid offer keys: …` in the dispatched string.
+    # Without these the agent invents snake_case names and counter-offers
+    # bounce as counter_offer_invalid_keys.
+    if tick_seen and tick_payload is not None:
+        issues = tick_payload.get("issues") or tick_payload.get("issue_options")
+        has_keys = bool(issues) and (
+            (isinstance(issues, dict) and len(issues) > 0)
+            or (isinstance(issues, list) and len(issues) > 0)
+        )
+        check(
+            ctx,
+            "tick payload carries canonical issue keys",
+            has_keys,
+            error=f"tick payload lacks issues/issue_options: keys={list(tick_payload.keys())}"
+            if not has_keys else None,
+        )
 
     if not tick_seen:
         for name in skip_all[4:]:
