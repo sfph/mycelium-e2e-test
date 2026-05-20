@@ -455,7 +455,28 @@ def _parse_session_room(session_create_stdout: str, parent_room: str) -> Optiona
 
 
 def cli_get_coordination_state(room_name: str) -> Optional[str]:
-    """Use 'mycelium --json room ls' to get coordination_state (avoids HTTP)."""
+    """Return the coordination state for *room_name*, handling both shapes.
+
+    For a parent room, returns Room.coordination_state from 'mycelium --json
+    room ls' (``idle``/``synthesizing``). For a session room of the form
+    ``<parent>:session:<short_id>``, the relevant state lives on the
+    CoordinationSession row instead (``waiting``/``active``/``complete``/
+    ``failed``); falls back to ``GET /api/coordination-sessions?parent_room=...``
+    and matches by short_id. Returns None if neither lookup yields a row.
+    """
+    if ":session:" in room_name:
+        parent, _, short_id = room_name.partition(":session:")
+        code, body = http_get(
+            f"{BACKEND_URL}/coordination-sessions?parent_room={parent}&limit=200"
+        )
+        if code == 200:
+            try:
+                for sess in json.loads(body) or []:
+                    if sess.get("short_id") == short_id:
+                        return sess.get("state")
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
     info = cli_get_room_info(room_name)
     return info.get("coordination_state") if info else None
 
@@ -1241,6 +1262,186 @@ def test_doctor_clean(ctx: TestContext):
         skipped=bool(warnings),
         skip_reason="\n".join(warn_lines) if warnings else None,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 6d: CFN LLM token counters (ioc-cognition-fabric-node-svc ≥ 0.1.5)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# CFN node-svc 0.1.5 added a litellm usage callback that emits per-call token
+# counts back to the mycelium backend, where they accumulate under the
+# ``cfn_llm.*`` counter group on /api/observability. ``mycelium metrics show
+# cost`` reads this group to estimate $ spend per pipeline / per room.
+#
+# This regression test spawns a coordination session, snapshots the cfn_llm
+# counters before and after, and asserts that:
+#   1. ``cfn_llm.calls`` actually advanced (callback is registered + firing),
+#   2. ``input_tokens`` and ``output_tokens`` advanced together (the callback
+#      surfaces both legs, not just one),
+#   3. ``cfn_llm.by_room.<our_session_room>.*`` exists for our session (the
+#      per-room dimension is being populated, which is what the cost view
+#      needs to attribute spend to the right room).
+#
+# If the CFN image is downgraded below 0.1.5 — or if the callback is silently
+# disabled by an upstream change — this test fails with a clear diff between
+# pre/post snapshots, locking in 0.1.5 as the new floor.
+
+
+def _fetch_observability_counters() -> dict:
+    """GET /api/observability and return the ``counters`` dict (empty on error)."""
+    code, body = http_get(f"{BACKEND_URL}/observability")
+    if code != 200:
+        return {}
+    try:
+        return json.loads(body).get("counters") or {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _cfn_llm_counter(counters: dict, key: str) -> int:
+    """Sum cfn_llm.by_pipeline.<pipeline>.<key> across all pipelines.
+
+    Counters are flat ints keyed by dotted strings under the ``cfn_llm`` group.
+    node-svc ≥ 0.1.5 exposes per-pipeline rollups (``by_pipeline.<name>.calls``,
+    ``...input_tokens``, ``...output_tokens``); there is no top-level
+    ``cfn_llm.calls`` aggregate. Sum across all pipelines so adding new ones
+    (e.g. ``intent_discovery``-only) stays counted automatically. Missing keys
+    are treated as 0 so before/after deltas work on the first run after backend
+    start.
+    """
+    grp = counters.get("cfn_llm") or {}
+    suffix = f".{key}"
+    total = 0
+    for k, v in grp.items():
+        if k.startswith("by_pipeline.") and k.endswith(suffix):
+            try:
+                total += int(v)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def test_cfn_llm_counters(ctx: TestContext):
+    """Regression coverage for CFN node-svc 0.1.5 litellm usage callback.
+
+    Spawns a fresh coordination session via ``session create`` + two
+    ``session join`` calls — exactly the path that triggers CFN's
+    ``intent_discovery`` + ``generate_options`` LLM calls at session start.
+    Snapshots ``cfn_llm.*`` counters from /api/observability before and after,
+    then asserts the deltas are non-zero and the per-room dimension is
+    populated for our session room.
+
+    Expected baseline: ``ioc-cognition-fabric-node-svc`` image at or after
+    0.1.5. On pre-0.1.5 the cfn_llm group either doesn't exist or never
+    advances, and this test fails with a clear "no LLM telemetry" message.
+    """
+    print_section(64, "CFN LLM token counters (node-svc 0.1.5)")
+
+    room = f"{ctx.room_name}-cfn-llm"
+    rc, _, stderr = run_cmd(["mycelium", "room", "create", room])
+    check(ctx, "CFN-LLM: create room", rc == 0, error=stderr if rc != 0 else None)
+    if rc != 0:
+        for name in [
+            "CFN-LLM: session spawn",
+            "CFN-LLM: cfn_llm.calls advanced",
+            "CFN-LLM: input+output tokens advanced",
+            "CFN-LLM: by_room.<session>.* populated",
+        ]:
+            check(ctx, name, False, skipped=True, skip_reason="Room create failed")
+        return
+    register_room(ctx, room)
+
+    before = _fetch_observability_counters()
+    calls_before = _cfn_llm_counter(before, "calls")
+    in_before = _cfn_llm_counter(before, "input_tokens")
+    out_before = _cfn_llm_counter(before, "output_tokens")
+
+    rc, _, stderr = run_cmd(["mycelium", "session", "create", "--room", room])
+    spawn_ok = rc == 0
+    check(ctx, "CFN-LLM: session spawn", spawn_ok, error=stderr if not spawn_ok else None)
+    if not spawn_ok:
+        for name in [
+            "CFN-LLM: cfn_llm.calls advanced",
+            "CFN-LLM: input+output tokens advanced",
+            "CFN-LLM: by_room.<session>.* populated",
+        ]:
+            check(ctx, name, False, skipped=True, skip_reason="Session create failed")
+        run_cmd(["mycelium", "room", "delete", room, "--force"])
+        return
+
+    # Two joins → CFN sees full participant set → fires start_negotiation,
+    # which is what runs intent_discovery + generate_options through litellm.
+    run_cmd([
+        "mycelium", "session", "join",
+        "--room", room, "--handle", "cfn-llm-a",
+        "--message", "Prioritize low latency over throughput",
+    ])
+    run_cmd([
+        "mycelium", "session", "join",
+        "--room", room, "--handle", "cfn-llm-b",
+        "--message", "Prioritize throughput over latency",
+    ])
+
+    # CFN's start_negotiation is async; intent_discovery + generate_options
+    # together take 5–10s on haiku. The counters themselves are reported from
+    # the CFN container to backend /api/observability via a buffered flush,
+    # which can lag another 15-30s behind the actual LLM calls (observed:
+    # calls completed at +6s, counter snapshot updated at +35-40s). Poll the
+    # observability endpoint for up to 90s so we catch the flush instead of
+    # giving up while it's still in flight.
+    deadline = time.time() + 90
+    after: dict = before
+    while time.time() < deadline:
+        time.sleep(2)
+        after = _fetch_observability_counters()
+        if _cfn_llm_counter(after, "calls") > calls_before:
+            break
+
+    calls_delta = _cfn_llm_counter(after, "calls") - calls_before
+    in_delta = _cfn_llm_counter(after, "input_tokens") - in_before
+    out_delta = _cfn_llm_counter(after, "output_tokens") - out_before
+
+    check(
+        ctx,
+        "CFN-LLM: cfn_llm.calls advanced",
+        calls_delta > 0,
+        error=f"expected cfn_llm.calls to advance after session start; "
+              f"delta={calls_delta} (before={calls_before}, after="
+              f"{_cfn_llm_counter(after, 'calls')}). Is the node-svc image ≥ 0.1.5?"
+        if calls_delta <= 0 else None,
+    )
+    check(
+        ctx,
+        "CFN-LLM: input+output tokens advanced",
+        in_delta > 0 and out_delta > 0,
+        error=f"expected both input_tokens and output_tokens to advance; "
+              f"input_delta={in_delta}, output_delta={out_delta}"
+        if not (in_delta > 0 and out_delta > 0) else None,
+    )
+
+    # Look up which session room CFN actually negotiated against (sessions
+    # are pre-spawned with synthetic IDs); the by_room key uses the full
+    # ``<parent>:session:<id>`` form, so we just check that *some*
+    # by_room.* entry exists for our parent room. ``room`` is a freshly
+    # randomized ``e2e-test-<rand>-cfn-llm`` name, so before this test ran
+    # no by_room.<room>* keys existed; any value > 0 proves the
+    # per-room dimension is being populated for our session.
+    cfn_llm_after = after.get("cfn_llm") or {}
+    by_room_keys = [
+        k for k in cfn_llm_after
+        if k.startswith(f"by_room.{room}") and k.endswith(".calls")
+        and int(cfn_llm_after.get(k, 0) or 0) > 0
+    ]
+    check(
+        ctx,
+        "CFN-LLM: by_room.<session>.* populated",
+        bool(by_room_keys),
+        error=f"expected at least one cfn_llm.by_room.{room}*.calls > 0; "
+              f"found keys={by_room_keys or '(none)'}"
+        if not by_room_keys else None,
+    )
+
+    run_cmd(["mycelium", "room", "delete", room, "--force"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
