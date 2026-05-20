@@ -571,79 +571,91 @@ async def trigger_distributed_negotiation(
         #   * The gateway was restarted above with channels.mycelium-room.room
         #     pointing at our dynamic room, so the plugin subscribes to
         #     {room}:session:* and dispatches ticks correctly.
-        trigger_msg = f"""Distributed E2E Test: {topic}
+        trigger_msg = f"""Coordination exercise: {topic}
 
 {plain_mentions}
 
-Please coordinate on the following topic using Mycelium structured negotiation.
+Hi! This message is part of our automated coordination benchmark suite — a controlled test environment that exercises the Mycelium + CFN negotiation stack end-to-end. The mycelium room and coordination session are already provisioned for you on this host; your role is to participate as one of the negotiating agents so we can validate that the stack converges on a reasonable consensus.
+
+We're asking you to collaborate on:
 
 Topic: {topic}
 Room: {ctx.mycelium_room_name}
 
-Positions:
+Each participating agent is starting from this position:
 """
         for agent, position in positions.items():
             trigger_msg += f"- {agent}: {position}\n"
 
         trigger_msg += f"""
-Instructions (run EXACTLY these commands — do NOT run any others):
+How to participate (these are the standard mycelium-room steps from the agent SKILL — feel free to cross-reference them):
 
 1. Join the coordination session as yourself:
      mycelium session join --handle <your-handle> --room {ctx.mycelium_room_name} -m "<your position in one sentence>"
 
-2. Do NOT run `mycelium session await`. Per the mycelium plugin SKILL,
-   OpenClaw agents are woken by the gateway when CognitiveEngine
-   addresses them — `session await` is only for single-threaded CLI
-   sessions and will block the gateway thread. Simply return control
-   after the join. The gateway will resume your session when a tick
-   arrives; the tick payload will be injected into your next turn as
-   a block starting with `[Mycelium — coordination tick]`.
+2. After joining, return control rather than running `mycelium session await`.
+   In this gateway-driven setup the openclaw runtime will wake you when
+   CognitiveEngine has something for you; you'll see a block starting with
+   `[Mycelium — coordination tick]` in your next turn's input. (`session await`
+   is only useful for single-threaded CLI sessions and would block the
+   gateway thread here, so we skip it.)
 
-3. When a tick arrives, respond via the CLI:
+3. When a tick arrives, reply with whichever CLI verb fits your reasoning:
      mycelium negotiate respond accept --room {ctx.mycelium_room_name} --handle <your-handle>
-     # OR, only if the tick says can_counter_offer: true:
+     # or, when the tick says can_counter_offer: true:
      mycelium negotiate propose ISSUE=VALUE ISSUE=VALUE --room {ctx.mycelium_room_name} --handle <your-handle>
 
-4. After responding, return control again — the next tick will arrive
-   the same way. Continue until you receive a consensus message
-   (a block starting with `[Mycelium — consensus]`).
+4. Return control again after responding — the next tick arrives the same way.
+   Keep going until you receive a consensus message (block starting with
+   `[Mycelium — consensus]`), then you're done.
 
-The room and session are already created — do NOT run `mycelium room create` or `mycelium session create`.
-Briefly explain your reasoning in chat before each CLI command so the human can follow along.
+A couple of notes that usually help:
+
+- The room and session already exist, so you don't need to create them
+  (running `mycelium room create` or `mycelium session create` would just error).
+- Feel free to explain your reasoning in chat before each command so a human
+  observer can follow along.
+- If anything looks off (e.g. the CLI complains about an unknown room, or you
+  can't tell what the current state is), it's fine to skip a step and say so
+  in chat — we'd rather know about a real issue than have you guess.
 """
 
         # HTML formatted body with proper pill mentions
-        html_msg = f"""<strong>Distributed E2E Test: {topic}</strong><br/><br/>
+        html_msg = f"""<strong>Coordination exercise: {topic}</strong><br/><br/>
 
 {html_mentions}<br/><br/>
 
-Please coordinate on the following topic using Mycelium structured negotiation.<br/><br/>
+Hi! This message is part of our automated coordination benchmark suite — a controlled test environment that exercises the Mycelium + CFN negotiation stack end-to-end. The mycelium room and coordination session are already provisioned for you on this host; your role is to participate as one of the negotiating agents so we can validate that the stack converges on a reasonable consensus.<br/><br/>
+
+We're asking you to collaborate on:<br/><br/>
 
 <strong>Topic:</strong> {topic}<br/>
 <strong>Room:</strong> {ctx.mycelium_room_name}<br/><br/>
 
-<strong>Positions:</strong><br/>
+<strong>Each participating agent is starting from this position:</strong><br/>
 """
         for agent, position in positions.items():
             html_msg += f"- <strong>{agent}</strong>: {position}<br/>\n"
 
         html_msg += f"""<br/>
-<strong>Instructions (run EXACTLY these commands — do NOT run any others):</strong><br/><br/>
+<strong>How to participate</strong> (these are the standard mycelium-room steps from the agent SKILL — feel free to cross-reference them):<br/><br/>
 
 1. Join the coordination session as yourself:<br/>
      <code>mycelium session join --handle &lt;your-handle&gt; --room {ctx.mycelium_room_name} -m "&lt;your position in one sentence&gt;"</code><br/><br/>
 
-2. Do <strong>NOT</strong> run <code>mycelium session await</code>. Per the mycelium plugin SKILL, OpenClaw agents are woken by the gateway when CognitiveEngine addresses them — <code>session await</code> is only for single-threaded CLI sessions and will block the gateway thread. Simply return control after the join. The gateway will resume your session when a tick arrives; the tick payload will be injected into your next turn as a block starting with <code>[Mycelium — coordination tick]</code>.<br/><br/>
+2. After joining, return control rather than running <code>mycelium session await</code>. In this gateway-driven setup the openclaw runtime will wake you when CognitiveEngine has something for you; you'll see a block starting with <code>[Mycelium — coordination tick]</code> in your next turn's input. (<code>session await</code> is only useful for single-threaded CLI sessions and would block the gateway thread here, so we skip it.)<br/><br/>
 
-3. When a tick arrives, respond via the CLI:<br/>
+3. When a tick arrives, reply with whichever CLI verb fits your reasoning:<br/>
      <code>mycelium negotiate respond accept --room {ctx.mycelium_room_name} --handle &lt;your-handle&gt;</code><br/>
-     or, only if the tick says <code>can_counter_offer: true</code>:<br/>
+     or, when the tick says <code>can_counter_offer: true</code>:<br/>
      <code>mycelium negotiate propose ISSUE=VALUE ISSUE=VALUE --room {ctx.mycelium_room_name} --handle &lt;your-handle&gt;</code><br/><br/>
 
-4. After responding, return control again — the next tick will arrive the same way. Continue until you receive a consensus message (a block starting with <code>[Mycelium — consensus]</code>).<br/><br/>
+4. Return control again after responding — the next tick arrives the same way. Keep going until you receive a consensus message (block starting with <code>[Mycelium — consensus]</code>), then you're done.<br/><br/>
 
-The room and session are already created — do <strong>NOT</strong> run <code>mycelium room create</code> or <code>mycelium session create</code>.<br/>
-Briefly explain your reasoning in chat before each CLI command so the human can follow along.
+A couple of notes that usually help:<br/>
+- The room and session already exist, so you don't need to create them (running <code>mycelium room create</code> or <code>mycelium session create</code> would just error).<br/>
+- Feel free to explain your reasoning in chat before each command so a human observer can follow along.<br/>
+- If anything looks off (e.g. the CLI complains about an unknown room, or you can't tell what the current state is), it's fine to skip a step and say so in chat — we'd rather know about a real issue than have you guess.
 """
         
         # Send the trigger message with HTML formatting for proper mentions
@@ -2019,34 +2031,39 @@ async def test_skill_cross_channel_return_trip(test_ctx: TestContext):
 
         prompt_body = " ".join(f"@{a}:local" for a in agents) + f"""
 
-This is a NEW independent test run. Ignore any prior sessions or test history.
-You MUST execute the commands below — do not skip any step.
+Hi! This is part of our automated coordination benchmark suite — a controlled test environment that exercises the Mycelium + CFN negotiation stack end-to-end. The mycelium room and coordination session are already provisioned for you on this host. This is a fresh test run, so feel free to disregard any prior session history.
+
+We're asking you to collaborate on:
 
 Topic: {topic}
 Room: {exp_room}
 
-Each of you has a position:
+Each participating agent is starting from this position:
 - agent-beta: {positions["agent-beta"]}
 - claire-agent: {positions["claire-agent"]}
 - oclw5-agent: {positions["oclw5-agent"]}
 
-Run EXACTLY these commands — do NOT run any others:
+How to participate (these are the standard mycelium-room steps from the agent SKILL — feel free to cross-reference them):
 
 1. Join the coordination session as yourself:
      mycelium session join --handle YOUR_HANDLE --room {exp_room} -m "YOUR_POSITION"
 
-2. Do NOT run mycelium session await. The Mycelium channel plugin wakes you when CognitiveEngine addresses you.
+2. After joining, return control rather than running `mycelium session await`.
+   The mycelium-room channel plugin will wake you when CognitiveEngine has
+   something for you; you'll see a block starting with `[Mycelium —
+   coordination tick]` in your next turn's input.
 
-3. When a tick arrives, respond via the CLI:
+3. When a tick arrives, reply with whichever CLI verb fits your reasoning:
      mycelium negotiate respond accept --room {exp_room} --handle YOUR_HANDLE
-   or, only if the tick says can_counter_offer: true:
+   or, when the tick says `can_counter_offer: true`:
      mycelium negotiate propose ISSUE=VALUE ISSUE=VALUE --room {exp_room} --handle YOUR_HANDLE
 
-4. After responding, return control. Continue until the negotiation concludes.
+4. Return control after responding — keep going until the negotiation concludes
+   (you'll receive a block starting with `[Mycelium — consensus]`).
 
 5. The result will be auto-delivered back here by the Mycelium plugin.
 
-Briefly explain your reasoning before each CLI command."""
+Feel free to explain your reasoning in chat before each command so a human observer can follow along."""
 
         async with httpx.AsyncClient(timeout=10.0) as http:
             r = await http.post(
