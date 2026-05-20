@@ -217,7 +217,7 @@ async def get_or_create_test_room(observer_token: str, agent_handles: list[str])
 async def wait_for_negotiation_responses(
     session_room: Optional[str],
     expected_agents: list[str],
-    timeout_seconds: int = 180,
+    timeout_seconds: int = 240,
     poll_interval: int = 5,
 ) -> dict[str, list[str]]:
     """
@@ -237,6 +237,15 @@ async def wait_for_negotiation_responses(
       agent acted) and the JSON ``content`` payload (carries the agent's
       action, positions, and rationale — used by content-aware checks
       like "Technical discussion occurred").
+
+    The function polls every ``poll_interval`` seconds and returns *as
+    soon as* all expected agents have written ≥1 ``direct`` message, so
+    ``timeout_seconds`` is a ceiling, not a wait. Default is 240s after
+    a 2026-05-20 test_40 cold-start observed CFN taking 172s between the
+    trigger and the first ``coordination_tick`` (LLM warm-up +
+    ``intent_discovery`` initialization on a freshly recreated node-svc
+    container); agents themselves replied 12s after the tick. Warm-path
+    runs typically complete in <60s and exit early.
 
     Returns a dict mapping agent handle → list of message ``content``
     strings (typically JSON-encoded reply payloads). An empty list means
@@ -741,7 +750,7 @@ async def test_distributed_two_agent(test_ctx: TestContext):
         # to the backend session room, NOT to the Matrix observer room, so
         # observing Matrix here used to register a false negative.
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=120
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
@@ -855,7 +864,7 @@ async def test_distributed_three_agent(test_ctx: TestContext):
         # Wait for agent responses via the CFN round-trace ring buffer
         # (Mycelium-channel replies; see wait_for_negotiation_responses).
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=180
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
@@ -956,7 +965,7 @@ async def test_distributed_architecture(test_ctx: TestContext):
         # Wait for agent replies in the backend session room
         # (see wait_for_negotiation_responses for why we don't poll Matrix).
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=120
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
@@ -1071,7 +1080,7 @@ async def test_distributed_resource_allocation(test_ctx: TestContext):
         # Wait for agent replies in the backend session room
         # (see wait_for_negotiation_responses for why we don't poll Matrix).
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=180
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
@@ -1194,7 +1203,7 @@ async def test_distributed_asymmetric_stakes(test_ctx: TestContext):
         # Wait for agent replies in the backend session room
         # (see wait_for_negotiation_responses for why we don't poll Matrix).
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=120
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
@@ -1320,7 +1329,7 @@ async def test_distributed_preexisting_context(test_ctx: TestContext):
         # Wait for agent replies in the backend session room
         # (see wait_for_negotiation_responses for why we don't poll Matrix).
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=120
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
@@ -1441,7 +1450,7 @@ async def test_distributed_feature_prioritization(test_ctx: TestContext):
         # Wait for agent replies in the backend session room
         # (see wait_for_negotiation_responses for why we don't poll Matrix).
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=180
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
@@ -1604,7 +1613,7 @@ async def test_distributed_cross_device_only(test_ctx: TestContext):
         # Wait for agent replies in the backend session room
         # (see wait_for_negotiation_responses for why we don't poll Matrix).
         responses = await wait_for_negotiation_responses(
-            ctx.session_room_name, agents, timeout_seconds=120
+            ctx.session_room_name, agents
         )
 
         agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
