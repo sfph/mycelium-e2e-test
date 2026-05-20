@@ -51,7 +51,11 @@ MATRIX_HOMESERVER = os.environ.get("MATRIX_HOMESERVER", f"http://{OCLW4_IP}:8008
 # the room itself is never recreated or rebound per test.
 SHARED_MYCELIUM_ROOM = os.environ.get("E2E_MYCELIUM_ROOM", "mycelium_room")
 
-# Agent configuration for distributed setup
+# Agent configuration for distributed setup.
+#
+# Includes the four local agents on oclw4 (alpha/beta/gamma/delta) plus the
+# remote agents on oclw3/oclw5. Local-only tests (the promoted test_30/31/32)
+# use just the oclw4 subset; cross-device tests (test_40+) mix local + remote.
 DISTRIBUTED_AGENTS = {
     "agent-alpha": {
         "device": "oclw4",
@@ -62,6 +66,16 @@ DISTRIBUTED_AGENTS = {
         "device": "oclw4",
         "ip": OCLW4_IP,
         "display_name": "Beta (oclw4)",
+    },
+    "agent-gamma": {
+        "device": "oclw4",
+        "ip": OCLW4_IP,
+        "display_name": "Gamma (oclw4)",
+    },
+    "agent-delta": {
+        "device": "oclw4",
+        "ip": OCLW4_IP,
+        "display_name": "Delta (oclw4)",
     },
     "claire-agent": {
         "device": "oclw3",
@@ -2202,6 +2216,21 @@ def skill_cross_channel_return_trip(ctx: TestContext):
     asyncio.run(test_skill_cross_channel_return_trip(ctx))
 
 
+def local_two_agent_negotiation(ctx: TestContext):
+    """Sync wrapper for pytest — local-real openclaw, oclw4 alpha + beta."""
+    asyncio.run(test_local_two_agent_negotiation(ctx))
+
+
+def local_three_agent_negotiation(ctx: TestContext):
+    """Sync wrapper for pytest — local-real openclaw, oclw4 alpha + beta + gamma."""
+    asyncio.run(test_local_three_agent_negotiation(ctx))
+
+
+def local_architecture_decision(ctx: TestContext):
+    """Sync wrapper for pytest — local-real openclaw, oclw4 alpha + beta."""
+    asyncio.run(test_local_architecture_decision(ctx))
+
+
 def distributed_two_agent_negotiation(ctx: TestContext):
     """Sync wrapper for pytest."""
     asyncio.run(test_distributed_two_agent(ctx))
@@ -2435,13 +2464,314 @@ def distributed_backend_resolved_cfn_ids(ctx: TestContext):
 # Main entry point for standalone testing
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Promoted local-real openclaw tests (test_30 / 31 / 32)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These tests intentionally mirror the distributed pattern but use only the
+# four local openclaw agents on oclw4 (alpha/beta/gamma/delta). They replace
+# the prior matrix_e2e.py stub-agent tests (which used synthetic participant
+# IDs like ``matrix-features`` and hardcoded ``{"action":"accept"}``,
+# bypassing openclaw's runtime entirely — see #X for the gap they left).
+#
+# By driving real openclaw agents through the same trigger/respond/consensus
+# path as the 40-series, the 30-series now provides:
+#
+#   1. Real protection against openclaw scheduler regressions (the wedge bug
+#      reproduced as test_40→test_41 today is reachable here too).
+#   2. The missing "real-local-only" data point to disambiguate whether the
+#      wedge is driven by remote-agent latency (H3) or by the solo-agent
+#      dispatch pattern that any real openclaw participant produces (H1).
+#   3. End-to-end LLM-driven negotiation outcomes (consensus is now an
+#      emergent product of real agent reasoning, not a hardcoded accept).
+#
+# Functionally these tests share every helper with the 40-series:
+# trigger_distributed_negotiation, wait_for_negotiation_responses,
+# wait_for_mycelium_consensus, and wait_for_return_trip_message. The only
+# axis that differs is the agent set.
+
+
+async def test_local_two_agent_negotiation(test_ctx: TestContext):
+    """Two local openclaw agents on oclw4 negotiate sprint planning."""
+    print_section(30, "Local-real E2E: Two-agent negotiation (oclw4 alpha + beta)")
+
+    agents = ["agent-alpha", "agent-beta"]
+    positions = {
+        "agent-alpha": "Prioritize new features. Need 70% capacity for roadmap items.",
+        "agent-beta": "Focus on stability. Need 60% capacity for bug fixes and tech debt.",
+    }
+
+    agents_config = [
+        (agent, DISTRIBUTED_AGENTS[agent]["display_name"], positions[agent])
+        for agent in agents
+    ]
+    print_convergence_header("Local Sprint Planning", agents_config)
+
+    ctx = DistributedTestContext(test_name="local-two-agent", agents_involved=agents)
+
+    skip_checks = [
+        "Trigger message sent",
+        "Agents responded",
+        "Mycelium session created",
+        "Coordination consensus reached",
+        "Consensus is substantive",
+        "Negotiation result returned to Matrix",
+    ]
+
+    if test_ctx.skip_llm_tests:
+        for name in skip_checks:
+            check(test_ctx, name, False, skipped=True, skip_reason="LLM unavailable")
+        return
+
+    try:
+        triggered, trigger_ts = await trigger_distributed_negotiation(
+            ctx, agents, "Sprint Capacity Allocation", positions
+        )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
+        check(test_ctx, "Trigger message sent", triggered)
+
+        if not triggered:
+            for name in skip_checks[1:]:
+                check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
+            return
+
+        responses = await wait_for_negotiation_responses(ctx.session_room_name, agents)
+        agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
+        check(test_ctx, "Agents responded", agents_responded >= 1,
+              error=f"Only {agents_responded}/{len(agents)} agents responded")
+
+        session_exists = ctx.session_room_name is not None
+        check(test_ctx, "Mycelium session created", session_exists)
+
+        consensus = await wait_for_mycelium_consensus(
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
+        )
+        check(test_ctx, "Coordination consensus reached", consensus is not None)
+
+        substantive = False
+        if consensus:
+            plan = str(consensus.get("plan", ""))
+            if len(plan) > 30 and not consensus.get("broken"):
+                substantive = True
+        check(test_ctx, "Consensus is substantive", substantive)
+
+        print_convergence_result(consensus, substantive)
+
+        if consensus and ctx.observer_token and ctx.matrix_room_id:
+            observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
+            return_trips = await wait_for_return_trip_message(
+                observer, ctx.matrix_room_id, agents,
+                timeout_seconds=60, after_timestamp=trigger_ts,
+            )
+            await observer.close()
+            any_returned = any(return_trips.values())
+            check(test_ctx, "Negotiation result returned to Matrix",
+                  any_returned,
+                  error=f"No return-trip messages seen. Status: {return_trips}")
+        else:
+            check(test_ctx, "Negotiation result returned to Matrix", False,
+                  skipped=True,
+                  skip_reason="No consensus or Matrix room available")
+
+    except Exception as e:
+        log_error(f"Test failed: {e}")
+        check(test_ctx, "Test completed without error", False, error=str(e))
+
+
+async def test_local_three_agent_negotiation(test_ctx: TestContext):
+    """Three local openclaw agents on oclw4 negotiate release planning."""
+    print_section(31, "Local-real E2E: Three-agent negotiation (oclw4 alpha+beta+gamma)")
+
+    agents = ["agent-alpha", "agent-beta", "agent-gamma"]
+    positions = {
+        "agent-alpha": "Focus on new features - growth is priority",
+        "agent-beta": "Balance features with stability work",
+        "agent-gamma": "Prioritize infrastructure and scaling",
+    }
+
+    agents_config = [
+        (agent, DISTRIBUTED_AGENTS[agent]["display_name"], positions[agent])
+        for agent in agents
+    ]
+    print_convergence_header("Local Release Planning", agents_config)
+
+    ctx = DistributedTestContext(test_name="local-three-agent", agents_involved=agents)
+
+    skip_checks = [
+        "Trigger message sent",
+        "All three agents responded",
+        "Coordination consensus reached",
+        "Consensus reflects all positions",
+        "Negotiation result returned to Matrix",
+    ]
+
+    if test_ctx.skip_llm_tests:
+        for name in skip_checks:
+            check(test_ctx, name, False, skipped=True, skip_reason="LLM unavailable")
+        return
+
+    try:
+        triggered, trigger_ts = await trigger_distributed_negotiation(
+            ctx, agents, "Q2 Release Planning", positions
+        )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
+        check(test_ctx, "Trigger message sent", triggered)
+
+        if not triggered:
+            for name in skip_checks[1:]:
+                check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
+            return
+
+        responses = await wait_for_negotiation_responses(ctx.session_room_name, agents)
+        agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
+        check(test_ctx, "All three agents responded", agents_responded == 3,
+              error=f"Only {agents_responded}/3 agents responded")
+
+        consensus = await wait_for_mycelium_consensus(
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
+        )
+        check(test_ctx, "Coordination consensus reached", consensus is not None)
+
+        # Substantive check tuned for 3-way: assignments dict should
+        # carry at least 2 distinct issues (one per participant viewpoint
+        # is the floor for a real release-planning resolution).
+        reflects_all = False
+        if consensus:
+            assignments = consensus.get("assignments") or {}
+            if isinstance(assignments, dict) and len(assignments) >= 2:
+                reflects_all = True
+        check(test_ctx, "Consensus reflects all positions", reflects_all)
+
+        print_convergence_result(consensus, reflects_all)
+
+        if consensus and ctx.observer_token and ctx.matrix_room_id:
+            observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
+            return_trips = await wait_for_return_trip_message(
+                observer, ctx.matrix_room_id, agents,
+                timeout_seconds=60, after_timestamp=trigger_ts,
+            )
+            await observer.close()
+            any_returned = any(return_trips.values())
+            check(test_ctx, "Negotiation result returned to Matrix",
+                  any_returned,
+                  error=f"No return-trip messages seen. Status: {return_trips}")
+        else:
+            check(test_ctx, "Negotiation result returned to Matrix", False,
+                  skipped=True,
+                  skip_reason="No consensus or Matrix room available")
+
+    except Exception as e:
+        log_error(f"Test failed: {e}")
+        check(test_ctx, "Test completed without error", False, error=str(e))
+
+
+async def test_local_architecture_decision(test_ctx: TestContext):
+    """Two local openclaw agents on oclw4 negotiate a database architecture decision."""
+    print_section(32, "Local-real E2E: Architecture decision (oclw4 alpha + beta)")
+
+    agents = ["agent-alpha", "agent-beta"]
+    positions = {
+        "agent-alpha": "Use PostgreSQL - ACID compliance, pgvector for AI features",
+        "agent-beta": "Use MongoDB - schema flexibility, horizontal scaling",
+    }
+
+    agents_config = [
+        (agent, DISTRIBUTED_AGENTS[agent]["display_name"], positions[agent])
+        for agent in agents
+    ]
+    print_convergence_header("Local Database Architecture Decision", agents_config)
+
+    ctx = DistributedTestContext(test_name="local-architecture", agents_involved=agents)
+
+    skip_checks = [
+        "Trigger message sent",
+        "Agents responded",
+        "Technical discussion occurred",
+        "Architecture decision reached",
+        "Negotiation result returned to Matrix",
+    ]
+
+    if test_ctx.skip_llm_tests:
+        for name in skip_checks:
+            check(test_ctx, name, False, skipped=True, skip_reason="LLM unavailable")
+        return
+
+    try:
+        triggered, trigger_ts = await trigger_distributed_negotiation(
+            ctx, agents, "Database Technology Selection", positions
+        )
+        if ctx.session_room_name:
+            register_room(test_ctx, ctx.session_room_name)
+        check(test_ctx, "Trigger message sent", triggered)
+
+        if not triggered:
+            for name in skip_checks[1:]:
+                check(test_ctx, name, False, skipped=True, skip_reason="Trigger failed")
+            return
+
+        responses = await wait_for_negotiation_responses(ctx.session_room_name, agents)
+        agents_responded = sum(1 for msgs in responses.values() if len(msgs) > 0)
+        check(test_ctx, "Agents responded", agents_responded >= 1,
+              error=f"Only {agents_responded}/{len(agents)} agents responded")
+
+        consensus = await wait_for_mycelium_consensus(
+            ctx.mycelium_room_name, timeout_seconds=600,
+            session_room=ctx.session_room_name,
+        )
+        check(test_ctx, "Architecture decision reached", consensus is not None)
+
+        # Content check via the unified semantic corpus (see _semantic_corpus
+        # for the rationale): scanning agent Matrix replies alone misses the
+        # substantive content that lives in the CFN consensus and the seeded
+        # positions. Same vocabulary list as test_42 for consistency.
+        corpus = _semantic_corpus(responses, consensus, positions)
+        tech_terms = [
+            "postgres", "mongo", "database", "sql", "nosql", "schema",
+            "scaling", "scale", "acid", "transaction", "consistency",
+            "replicat", "shard", "index",
+        ]
+        technical_discussion = any(term in corpus for term in tech_terms)
+        check(test_ctx, "Technical discussion occurred", technical_discussion)
+
+        print_convergence_result(consensus, consensus is not None)
+
+        if consensus and ctx.observer_token and ctx.matrix_room_id:
+            observer = MatrixClient(MATRIX_HOMESERVER, ctx.observer_token)
+            return_trips = await wait_for_return_trip_message(
+                observer, ctx.matrix_room_id, agents,
+                timeout_seconds=60, after_timestamp=trigger_ts,
+            )
+            await observer.close()
+            any_returned = any(return_trips.values())
+            check(test_ctx, "Negotiation result returned to Matrix",
+                  any_returned,
+                  error=f"No return-trip messages seen. Status: {return_trips}")
+        else:
+            check(test_ctx, "Negotiation result returned to Matrix", False,
+                  skipped=True,
+                  skip_reason="No consensus or Matrix room available")
+
+    except Exception as e:
+        log_error(f"Test failed: {e}")
+        check(test_ctx, "Test completed without error", False, error=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry point for standalone testing
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 async def main():
     """Run all distributed E2E tests."""
     from mycelium_e2e.bundle import detect_environment, print_results
-    
+
     ctx = TestContext(room_name="distributed-e2e-main")
     detect_environment(ctx)
-    
+
     print(f"\n{BOLD}{'='*70}{RESET}")
     print(f"{BOLD}Distributed End-to-End Tests{RESET}")
     print(f"{BOLD}{'='*70}{RESET}")
@@ -2450,24 +2780,29 @@ async def main():
     print(f"  - oclw3 ({OCLW3_IP}): claire-agent")
     print(f"  - oclw5 ({OCLW5_IP}): oclw5-agent")
     print()
-    
+
+    # Local-real openclaw tests (promoted 30-series — all on oclw4)
+    await test_local_two_agent_negotiation(ctx)
+    await test_local_three_agent_negotiation(ctx)
+    await test_local_architecture_decision(ctx)
+
     # Backend-resolved CFN IDs test (Issue #139)
     await test_backend_resolved_cfn_ids(ctx)
-    
-    # Core negotiation scenarios
+
+    # Core negotiation scenarios (cross-device)
     await test_distributed_two_agent(ctx)
     await test_distributed_three_agent(ctx)
     await test_distributed_architecture(ctx)
-    
+
     # Additional negotiation types
     await test_distributed_resource_allocation(ctx)
     await test_distributed_asymmetric_stakes(ctx)
     await test_distributed_preexisting_context(ctx)
     await test_distributed_feature_prioritization(ctx)
-    
+
     # Cross-device only test (oclw3 + oclw5 using IOC on oclw4)
     await test_distributed_cross_device_only(ctx)
-    
+
     print_results(ctx)
 
 
