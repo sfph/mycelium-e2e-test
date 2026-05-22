@@ -2295,27 +2295,34 @@ def distributed_cross_device_only(ctx: TestContext):
 async def test_backend_resolved_cfn_ids(test_ctx: TestContext):
     """
     Test that leaf nodes can ingest knowledge without knowing workspace_id or mas_id.
-    
-    This validates the fix for issue #139: leaf nodes send only room_name, and the
-    backend resolves workspace_id and mas_id from:
-      1. The room's DB record (if room has mas_id)
-      2. Backend settings (fallback)
-    
+
+    This validates the fix for issue #139: leaf nodes send only room_name,
+    and the backend resolves workspace_id + mas_id from the room's DB record.
+
+    We exercise *two* rooms (a primary and a fresh alt) instead of the
+    legacy "no room_name → settings.MAS_ID fallback" path.  CFN's per-room
+    MAS model makes the global fallback architecturally suspect (silent
+    wrong-MAS writes if the setting points at the wrong workspace), and
+    IOC-mode installs leave it unset anyway — so the contract we lock in
+    is "every CFN call carries a real room context".
+
     Test flow:
-      1. Create a test room (gets its own mas_id from CFN)
+      1. Create a primary test room (gets its own mas_id from CFN)
       2. Verify leaf node configs don't have workspace_id/mas_id
-      3. Ingest knowledge from leaf node with only room_name
-      4. Verify knowledge was stored in the correct MAS (room's mas_id, not default)
-      5. Query the knowledge back
+      3. Ingest knowledge from leaf node with only the primary room_name
+      4. Verify knowledge was stored in the correct MAS (room's mas_id)
+      5. Create a second room and ingest into it from the same leaf
+         (cross-room routing — replaces the legacy fallback check)
+      6. Query the knowledge back
     """
     print_section(48, "Backend-Resolved CFN IDs (leaf nodes without IDs)")
-    
+
     skip_checks = [
         "Test room created",
         "Leaf node config has no mas_id",
         "Ingest from leaf (room_name only)",
         "Ingest routed to MAS",
-        "Ingest fallback (no room_name)",
+        "Ingest into alt room (cross-room routing)",
         "Query returns ingested knowledge",
     ]
     
@@ -2325,7 +2332,8 @@ async def test_backend_resolved_cfn_ids(test_ctx: TestContext):
         return
     
     room_name = f"dist-cfn-ids-{uuid.uuid4().hex[:8]}"
-    
+    alt_room_name = f"dist-cfn-ids-alt-{uuid.uuid4().hex[:8]}"
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as http:
             # 1. Create test room - it may or may not have mas_id (depends on config)
@@ -2412,32 +2420,58 @@ async def test_backend_resolved_cfn_ids(test_ctx: TestContext):
             
             log_info(f"CFN response: {cfn_message}")
             
-            # 5. Test fallback: ingest without room_name (uses settings.MAS_ID)
-            # Note: we don't include test_marker here to avoid JSON escaping issues
-            fallback_payload = json.dumps({
-                "agent_id": "leaf-fallback-agent",
-                "records": [{"response": "Fallback test. Default MAS route verified."}],
-            })
-            
-            log_info("Testing fallback ingest (no room_name)...")
-            # Use subprocess with explicit shell to handle JSON properly
-            ssh_cmd = f'curl -sf -X POST {BACKEND_URL}/knowledge/ingest -H "Content-Type: application/json" -d \'{fallback_payload}\''
-            result = subprocess.run(
-                ["ssh", "oclw3", ssh_cmd],
-                capture_output=True, text=True, timeout=90  # Increased timeout for LLM processing
+            # 5. Cross-room routing: create a *second* room and ingest into it
+            # from the same leaf node.  This replaces the legacy "no room_name
+            # → settings.MAS_ID fallback" check — see this function's
+            # docstring for why the global fallback path is intentionally
+            # not exercised any more.
+            log_info(f"Creating alt test room: {alt_room_name}")
+            r = await http.post(
+                f"{BACKEND_URL}/rooms",
+                json={"name": alt_room_name, "is_public": True},
             )
-            
-            fallback_stdout = result.stdout.strip()
-            fallback_stderr = result.stderr.strip()
-            fallback_ok = result.returncode == 0 and "Successfully saved" in fallback_stdout
-            
-            if not fallback_ok:
-                log_debug(f"Fallback returncode: {result.returncode}")
-                log_debug(f"Fallback stdout: {fallback_stdout}")
-                log_debug(f"Fallback stderr: {fallback_stderr}")
-            
-            check(test_ctx, "Ingest fallback (no room_name)", fallback_ok,
-                  error=f"Fallback failed (rc={result.returncode}): {fallback_stdout or fallback_stderr}" if not fallback_ok else None)
+            alt_room_created = r.status_code in (200, 201)
+
+            if not alt_room_created:
+                check(
+                    test_ctx,
+                    "Ingest into alt room (cross-room routing)",
+                    False,
+                    error=f"alt room create failed: status={r.status_code}",
+                )
+            else:
+                alt_payload = json.dumps({
+                    "room_name": alt_room_name,
+                    "agent_id": "leaf-alt-agent",
+                    "records": [{"response": "Cross-room test. Alt-room MAS route verified."}],
+                })
+
+                log_info("Testing cross-room ingest from leaf (alt room)...")
+                # Use subprocess with explicit shell to handle JSON properly
+                ssh_cmd = f'curl -sf -X POST {BACKEND_URL}/knowledge/ingest -H "Content-Type: application/json" -d \'{alt_payload}\''
+                result = subprocess.run(
+                    ["ssh", "oclw3", ssh_cmd],
+                    capture_output=True, text=True, timeout=90,  # LLM processing
+                )
+
+                alt_stdout = result.stdout.strip()
+                alt_stderr = result.stderr.strip()
+                alt_ok = result.returncode == 0 and "Successfully saved" in alt_stdout
+
+                if not alt_ok:
+                    log_debug(f"Alt-room returncode: {result.returncode}")
+                    log_debug(f"Alt-room stdout: {alt_stdout}")
+                    log_debug(f"Alt-room stderr: {alt_stderr}")
+
+                check(
+                    test_ctx,
+                    "Ingest into alt room (cross-room routing)",
+                    alt_ok,
+                    error=(
+                        f"Alt-room ingest failed (rc={result.returncode}): "
+                        f"{alt_stdout or alt_stderr}"
+                    ) if not alt_ok else None,
+                )
             
             # 6. Query the knowledge back (backend resolves mas_id from settings if not provided)
             log_info("Querying ingested knowledge...")
@@ -2463,13 +2497,18 @@ async def test_backend_resolved_cfn_ids(test_ctx: TestContext):
         check(test_ctx, "Test completed without error", False, error=str(e))
     
     finally:
-        # Cleanup: delete test room
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as http:
-                await http.delete(f"{BACKEND_URL}/rooms/{room_name}")
-                log_info(f"Cleaned up room: {room_name}")
-        except Exception:
-            pass
+        # Cleanup: delete both test rooms (best-effort — ignore failures so a
+        # cleanup hiccup on one doesn't mask a leak from the other).
+        async def _delete(name: str) -> None:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as http:
+                    await http.delete(f"{BACKEND_URL}/rooms/{name}")
+                    log_info(f"Cleaned up room: {name}")
+            except Exception:
+                pass
+
+        await _delete(room_name)
+        await _delete(alt_room_name)
 
 
 def distributed_backend_resolved_cfn_ids(ctx: TestContext):

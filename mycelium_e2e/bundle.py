@@ -1716,11 +1716,14 @@ def test_ioc_cfn(ctx: TestContext):
     and /api/cfn/knowledge/query to verify round-trip.
 
     Key design (issue #139): Leaf nodes only send room_name — the backend
-    resolves workspace_id and mas_id from:
-      1. The room's DB record (if room_name provided and room has mas_id)
-      2. Backend settings.MAS_ID / settings.WORKSPACE_ID (fallback)
+    resolves workspace_id and mas_id from the room's DB record.
 
-    This test simulates a leaf node that doesn't know any IDs.
+    We deliberately exercise *two* distinct rooms (`ctx.room_name` and a
+    fresh `*-alt` sibling) instead of the legacy "no room_name → fall back
+    to settings.MAS_ID" path; CFN's per-room MAS model means the global
+    fallback is at best ambiguous and at worst routes writes to the wrong
+    workspace, so anchoring every call to a real room is the contract we
+    want to lock in.
     """
     print_section(8, "Knowledge graph (CFN-compatible API)")
 
@@ -1728,7 +1731,7 @@ def test_ioc_cfn(ctx: TestContext):
     status, body = http_get(f"{BACKEND_URL}/cfn/knowledge/list?limit=1")
     if status == 503:
         check(ctx, "Knowledge ingest (room_name)", False, skipped=True, skip_reason="CFN not configured")
-        check(ctx, "Knowledge ingest (no room)", False, skipped=True, skip_reason="CFN not configured")
+        check(ctx, "Knowledge ingest (alt room)", False, skipped=True, skip_reason="CFN not configured")
         check(ctx, "Knowledge query", False, skipped=True, skip_reason="CFN not configured")
         return
 
@@ -1775,40 +1778,74 @@ def test_ioc_cfn(ctx: TestContext):
             pass
     check(ctx, "Knowledge ingest (room_name)", status == 200 and error_msg is None, error=error_msg)
 
-    # Test 2: Ingest with NO room_name (leaf node scenario without room context)
-    # Backend falls back to settings.MAS_ID
-    ingest_data_no_room = {
-        "agent_id": "e2e-test-agent-no-room",
-        "records": [{"response": f"E2E fallback test: {test_marker}. Temperature is warm today."}],
-    }
-    status, body = http_post(ingest_url, ingest_data_no_room, timeout=180)
-    error_msg = None
-    if status != 200:
-        error_msg = f"HTTP {status}"
-        if body:
-            try:
-                err_json = json.loads(body)
-                if "detail" in err_json:
-                    error_msg += f": {err_json['detail']}"
-            except:
-                error_msg += f"\n{body[:200]}"
+    # Test 2: Ingest into a SECOND room — proves backend routes per-room
+    # (each room has its own MAS, resolved from the room's DB record).
+    #
+    # This replaces the legacy "ingest with no room_name" check that relied
+    # on settings.MAS_ID as a global fallback.  CFN's per-room MAS model
+    # makes that fallback architecturally suspect (silent wrong-MAS writes
+    # if it ever points at the wrong row), and IOC-mode installs leave it
+    # unset anyway.  Going through a real room exercises the same leaf-node
+    # ergonomics ("client only knows the room name") without depending on
+    # the suspect fallback path.
+    alt_room_name = f"{test_marker}-alt"
+    status, body = http_post(
+        f"{BACKEND_URL}/rooms", {"name": alt_room_name, "is_public": True}
+    )
+    if status not in (200, 201):
+        check(
+            ctx,
+            "Knowledge ingest (alt room)",
+            False,
+            error=f"alt room create failed: HTTP {status}",
+        )
     else:
-        try:
-            resp = json.loads(body)
-            cfn_msg = resp.get("cfn_message", "")
-            if "error" in cfn_msg.lower() or "fail" in cfn_msg.lower():
-                error_msg = f"CFN error: {cfn_msg}"
-        except:
-            pass
-    check(ctx, "Knowledge ingest (no room)", status == 200 and error_msg is None, error=error_msg)
+        register_room(ctx, alt_room_name)
+        ingest_data_alt = {
+            "room_name": alt_room_name,
+            "agent_id": "e2e-test-agent-alt",
+            "records": [
+                {
+                    "response": f"E2E alt-room test: {test_marker}. Temperature is warm today."
+                }
+            ],
+        }
+        status, body = http_post(ingest_url, ingest_data_alt, timeout=180)
+        error_msg = None
+        if status != 200:
+            error_msg = f"HTTP {status}"
+            if body:
+                try:
+                    err_json = json.loads(body)
+                    if "detail" in err_json:
+                        error_msg += f": {err_json['detail']}"
+                except:
+                    error_msg += f"\n{body[:200]}"
+        else:
+            try:
+                resp = json.loads(body)
+                cfn_msg = resp.get("cfn_message", "")
+                if "error" in cfn_msg.lower() or "fail" in cfn_msg.lower():
+                    error_msg = f"CFN error: {cfn_msg}"
+            except:
+                pass
+        check(
+            ctx,
+            "Knowledge ingest (alt room)",
+            status == 200 and error_msg is None,
+            error=error_msg,
+        )
 
-    # Test 3: Query endpoint — also doesn't require explicit mas_id
-    # Backend resolves from settings.MAS_ID when not provided
+    # Test 3: Query endpoint with the mas_id we resolved in Test 1 — proves
+    # the write-then-read round trip works end-to-end without depending on
+    # settings.MAS_ID.  We pass mas_id explicitly because /cfn/knowledge/query
+    # has no room_name parameter today (see cfn_proxy.py); the natural way
+    # to scope a read is by mas_id, and we extracted that from Test 1's
+    # cfn_message ("graph_<mas-id-with-underscores>").
     query_url = f"{BACKEND_URL}/cfn/knowledge/query"
-    query_data = {
-        "intent": "Find information about weather conditions",
-        # No mas_id — backend resolves from settings
-    }
+    query_data: dict = {"intent": "Find information about weather conditions"}
+    if resolved_mas_id:
+        query_data["mas_id"] = resolved_mas_id
     # Same single-worker reasoning as the ingest above — queueing behind an
     # in-flight CFN negotiation can easily exceed 30s.
     status, body = http_post(query_url, query_data, timeout=180)
