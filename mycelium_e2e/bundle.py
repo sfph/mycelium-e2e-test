@@ -776,10 +776,18 @@ def detect_environment(ctx: TestContext):
     
     # IOC/CFN detection
     cfn_status, _ = http_get(f"{CFN_MGMT_URL}/health")
-    cfn_svc_status, _ = http_get(f"{CFN_SVC_URL}/health")
-    
+    # node-svc 0.1.6 dropped the public /health route; the real liveness probe
+    # moved to /api/internal/diagnostics/health. Try the new path first, fall
+    # back to the legacy /health for older images. Use a short timeout so a
+    # saturated node-svc (which serializes everything on one uvicorn loop)
+    # doesn't make us wait the full default budget here.
+    cfn_svc_status, _ = http_get(f"{CFN_SVC_URL}/api/internal/diagnostics/health", timeout=5)
+    if cfn_svc_status not in (200, 404):
+        cfn_svc_status, _ = http_get(f"{CFN_SVC_URL}/health", timeout=5)
+
     ctx.env_info["cfn_mgmt_reachable"] = cfn_status == 200
-    ctx.env_info["cfn_svc_reachable"] = cfn_svc_status in (200, 404)  # 404 is ok, means service is up
+    # 200 == healthy, 404 == route exists but path moved (still up)
+    ctx.env_info["cfn_svc_reachable"] = cfn_svc_status in (200, 404)
     ctx.env_info["ioc_active"] = ctx.env_info["cfn_mgmt_reachable"]
     
     if not ctx.env_info["ioc_active"]:
@@ -1322,31 +1330,62 @@ def _cfn_llm_counter(counters: dict, key: str) -> int:
 
 
 def test_cfn_llm_counters(ctx: TestContext):
-    """Regression coverage for CFN node-svc 0.1.5 litellm usage callback.
+    """Regression coverage for CFN node-svc 0.1.5+ litellm usage callback.
 
     Spawns a fresh coordination session via ``session create`` + two
     ``session join`` calls — exactly the path that triggers CFN's
     ``intent_discovery`` + ``generate_options`` LLM calls at session start.
-    Snapshots ``cfn_llm.*`` counters from /api/observability before and after,
-    then asserts the deltas are non-zero and the per-room dimension is
-    populated for our session room.
 
-    Expected baseline: ``ioc-cognition-fabric-node-svc`` image at or after
-    0.1.5. On pre-0.1.5 the cfn_llm group either doesn't exist or never
-    advances, and this test fails with a clear "no LLM telemetry" message.
+    Two-phase synchronization (each phase has its own granular check so the
+    failure message tells you which stage broke):
+
+      Phase 1 — ``coordination_start`` posted to the session room. This
+        proves the backend's join-window timer fired ``_run_tick(0)`` and
+        invoked ``_run_cfn_negotiation``. If this never appears, the
+        problem is upstream of CFN (e.g. join timer cancelled by a
+        previous teardown, or the backend's event loop was wedged).
+
+      Phase 2 — ``cfn_llm.calls`` global counter advances. The backend's
+        :func:`record_cfn_llm_usage` increments this synchronously when
+        node-svc's ``start_negotiation`` HTTP call returns with a ``_usage``
+        payload, so any lag here is in node-svc itself (or in the queue
+        in front of node-svc — it's single-worker uvicorn).
+
+    Timing budget reflects observed node-svc 0.1.6 behavior:
+    ``start_negotiation`` now invokes ``generate_options_with_memory`` which
+    fires a self-call to ``http://127.0.0.1:9002/api/.../shared-memories/query``.
+    That self-call currently fails in our environment and node-svc waits the
+    full upstream ``timeout_s=120.0`` before falling back to LLM-only.
+    Empirically, the whole start_negotiation round-trip takes ~125-130s on
+    the fallback path, and longer when node-svc is queueing behind a peer
+    test's negotiation. We give 60s for the join window + Phase 1, then 240s
+    for Phase 2, for a worst-case ~5 minutes per run. The test skips itself
+    if ``ctx.coordination_blocked_reason`` is set (LLM unavailable / CFN
+    unreachable) rather than failing hard.
     """
-    print_section(64, "CFN LLM token counters (node-svc 0.1.5)")
+    print_section(64, "CFN LLM token counters (node-svc 0.1.5+)")
+
+    check_names = [
+        "CFN-LLM: session spawn",
+        "CFN-LLM: coordination_start posted (Phase 1)",
+        "CFN-LLM: cfn_llm.calls advanced (Phase 2)",
+        "CFN-LLM: input+output tokens advanced",
+        "CFN-LLM: by_room.<session>.* populated",
+    ]
+
+    if ctx.coordination_blocked_reason:
+        check(ctx, "CFN-LLM: create room", False, skipped=True,
+              skip_reason=ctx.coordination_blocked_reason)
+        for name in check_names:
+            check(ctx, name, False, skipped=True,
+                  skip_reason=ctx.coordination_blocked_reason)
+        return
 
     room = f"{ctx.room_name}-cfn-llm"
     rc, _, stderr = run_cmd(["mycelium", "room", "create", room])
     check(ctx, "CFN-LLM: create room", rc == 0, error=stderr if rc != 0 else None)
     if rc != 0:
-        for name in [
-            "CFN-LLM: session spawn",
-            "CFN-LLM: cfn_llm.calls advanced",
-            "CFN-LLM: input+output tokens advanced",
-            "CFN-LLM: by_room.<session>.* populated",
-        ]:
+        for name in check_names:
             check(ctx, name, False, skipped=True, skip_reason="Room create failed")
         return
     register_room(ctx, room)
@@ -1356,21 +1395,31 @@ def test_cfn_llm_counters(ctx: TestContext):
     in_before = _cfn_llm_counter(before, "input_tokens")
     out_before = _cfn_llm_counter(before, "output_tokens")
 
-    rc, _, stderr = run_cmd(["mycelium", "session", "create", "--room", room])
+    # ``--json`` so we can extract the session display_name (``<room>:session:<short>``)
+    # deterministically rather than scraping the human-readable output.
+    rc, stdout, stderr = run_cmd(
+        ["mycelium", "--json", "session", "create", "--room", room]
+    )
     spawn_ok = rc == 0
     check(ctx, "CFN-LLM: session spawn", spawn_ok, error=stderr if not spawn_ok else None)
     if not spawn_ok:
-        for name in [
-            "CFN-LLM: cfn_llm.calls advanced",
-            "CFN-LLM: input+output tokens advanced",
-            "CFN-LLM: by_room.<session>.* populated",
-        ]:
+        for name in check_names[1:]:
             check(ctx, name, False, skipped=True, skip_reason="Session create failed")
         run_cmd(["mycelium", "room", "delete", room, "--force"])
         return
 
-    # Two joins → CFN sees full participant set → fires start_negotiation,
-    # which is what runs intent_discovery + generate_options through litellm.
+    session_room = _parse_session_room(stdout, room)
+    # Fall back to the API lookup if --json parsing failed (older CLI).
+    if not session_room:
+        for _ in range(10):
+            time.sleep(0.5)
+            session_room = find_session_room(room)
+            if session_room:
+                break
+
+    # Two joins → CFN sees full participant set → backend's join-window timer
+    # fires _run_tick(0) → _run_cfn_negotiation → CFN start_negotiation
+    # (intent_discovery + generate_options_with_memory).
     run_cmd([
         "mycelium", "session", "join",
         "--room", room, "--handle", "cfn-llm-a",
@@ -1382,50 +1431,105 @@ def test_cfn_llm_counters(ctx: TestContext):
         "--message", "Prioritize throughput over latency",
     ])
 
-    # CFN's start_negotiation is async; intent_discovery + generate_options
-    # together take 5–10s on haiku. The counters themselves are reported from
-    # the CFN container to backend /api/observability via a buffered flush,
-    # which can lag another 15-30s behind the actual LLM calls (observed:
-    # calls completed at +6s, counter snapshot updated at +35-40s). Poll the
-    # observability endpoint for up to 90s so we catch the flush instead of
-    # giving up while it's still in flight.
-    deadline = time.time() + 90
+    # ── Phase 1: wait for coordination_start ────────────────────────────────
+    # The join window is COORDINATION_JOIN_WINDOW_SECONDS=30 (extended on
+    # each subsequent join). After it expires, _run_tick(0) posts a
+    # ``coordination_start`` message to the session room *before* invoking
+    # CFN. Seeing this message proves the backend side of the chain is
+    # healthy. Budget: 60s = 30s join window + 30s slack for loop jitter.
+    phase1_deadline = time.time() + 60
+    coord_start_seen = False
+    if session_room:
+        while time.time() < phase1_deadline:
+            _, msgs = fetch_room_messages(session_room)
+            if any(m.get("message_type") == "coordination_start" for m in msgs):
+                coord_start_seen = True
+                break
+            time.sleep(2)
+
+    if not coord_start_seen:
+        # Dump enough state to disambiguate the failure modes without
+        # requiring a follow-up reproduction. ``session_state`` tells us
+        # whether the coord session row is even alive; ``recent_message_types``
+        # confirms whether any backend-posted messages reached the room.
+        session_state = (
+            cli_get_coordination_state(session_room)
+            if session_room else None
+        )
+        _, recent_msgs = (
+            fetch_room_messages(session_room) if session_room else (0, [])
+        )
+        recent_types = [m.get("message_type") for m in (recent_msgs or [])][:5]
+        check(
+            ctx,
+            "CFN-LLM: coordination_start posted (Phase 1)",
+            False,
+            error=(
+                f"no coordination_start message in {session_room or '<unresolved>'} "
+                f"within 60s; coord session state={session_state!r}, "
+                f"recent message_types={recent_types!r}. The backend's "
+                f"join-window timer didn't fire _run_tick(0). Look for "
+                f"`Coordination join timer started` / `_run_tick` activity "
+                f"in mycelium-backend logs."
+            ),
+        )
+        for name in check_names[2:]:
+            check(ctx, name, False, skipped=True,
+                  skip_reason="Phase 1 (coordination_start) did not fire")
+        run_cmd(["mycelium", "room", "delete", room, "--force"])
+        return
+
+    check(ctx, "CFN-LLM: coordination_start posted (Phase 1)", True)
+
+    # ── Phase 2: wait for cfn_llm.calls to advance ──────────────────────────
+    # node-svc 0.1.6's start_negotiation takes ~125-130s on the fallback path
+    # (120s self-call timeout + LLM-only fallback). We give 240s to absorb
+    # that plus queueing behind any in-flight peer negotiation. The counter
+    # is server-side in mycelium-backend and updates synchronously when CFN
+    # returns ``_usage`` — there is *no* separate flush delay.
+    phase2_deadline = time.time() + 240
     after: dict = before
-    while time.time() < deadline:
-        time.sleep(2)
+    while time.time() < phase2_deadline:
+        time.sleep(3)
         after = _fetch_observability_counters()
         if _cfn_llm_counter(after, "calls") > calls_before:
             break
 
-    calls_delta = _cfn_llm_counter(after, "calls") - calls_before
-    in_delta = _cfn_llm_counter(after, "input_tokens") - in_before
-    out_delta = _cfn_llm_counter(after, "output_tokens") - out_before
+    calls_after = _cfn_llm_counter(after, "calls")
+    in_after = _cfn_llm_counter(after, "input_tokens")
+    out_after = _cfn_llm_counter(after, "output_tokens")
+    calls_delta = calls_after - calls_before
+    in_delta = in_after - in_before
+    out_delta = out_after - out_before
 
     check(
         ctx,
-        "CFN-LLM: cfn_llm.calls advanced",
+        "CFN-LLM: cfn_llm.calls advanced (Phase 2)",
         calls_delta > 0,
-        error=f"expected cfn_llm.calls to advance after session start; "
-              f"delta={calls_delta} (before={calls_before}, after="
-              f"{_cfn_llm_counter(after, 'calls')}). Is the node-svc image ≥ 0.1.5?"
+        error=(
+            f"expected cfn_llm.calls to advance after coordination_start posted; "
+            f"delta={calls_delta} (before={calls_before}, after={calls_after}) "
+            f"over 240s. coordination_start fired but node-svc never returned a "
+            f"_usage payload — check node-svc logs for `execute initiate` / "
+            f"`execute initiated` for session_id={session_room!r}, and look "
+            f"for ``generate_options_with_memory: fabric lookup failed`` "
+            f"(the known 120s self-call hang)."
+        )
         if calls_delta <= 0 else None,
     )
     check(
         ctx,
         "CFN-LLM: input+output tokens advanced",
         in_delta > 0 and out_delta > 0,
-        error=f"expected both input_tokens and output_tokens to advance; "
-              f"input_delta={in_delta}, output_delta={out_delta}"
-        if not (in_delta > 0 and out_delta > 0) else None,
+        error=(
+            f"expected both input_tokens and output_tokens to advance; "
+            f"input_delta={in_delta}, output_delta={out_delta}"
+        ) if not (in_delta > 0 and out_delta > 0) else None,
     )
 
-    # Look up which session room CFN actually negotiated against (sessions
-    # are pre-spawned with synthetic IDs); the by_room key uses the full
-    # ``<parent>:session:<id>`` form, so we just check that *some*
-    # by_room.* entry exists for our parent room. ``room`` is a freshly
-    # randomized ``e2e-test-<rand>-cfn-llm`` name, so before this test ran
-    # no by_room.<room>* keys existed; any value > 0 proves the
-    # per-room dimension is being populated for our session.
+    # ``room`` is freshly randomized so any non-zero by_room.<room>* entry
+    # is unambiguously from this run. We check at least one ``.calls`` entry
+    # exists — the exact session short_id varies per spawn.
     cfn_llm_after = after.get("cfn_llm") or {}
     by_room_keys = [
         k for k in cfn_llm_after
@@ -1436,9 +1540,10 @@ def test_cfn_llm_counters(ctx: TestContext):
         ctx,
         "CFN-LLM: by_room.<session>.* populated",
         bool(by_room_keys),
-        error=f"expected at least one cfn_llm.by_room.{room}*.calls > 0; "
-              f"found keys={by_room_keys or '(none)'}"
-        if not by_room_keys else None,
+        error=(
+            f"expected at least one cfn_llm.by_room.{room}*.calls > 0; "
+            f"found keys={by_room_keys or '(none)'}"
+        ) if not by_room_keys else None,
     )
 
     run_cmd(["mycelium", "room", "delete", room, "--force"])
@@ -1611,11 +1716,14 @@ def test_ioc_cfn(ctx: TestContext):
     and /api/cfn/knowledge/query to verify round-trip.
 
     Key design (issue #139): Leaf nodes only send room_name — the backend
-    resolves workspace_id and mas_id from:
-      1. The room's DB record (if room_name provided and room has mas_id)
-      2. Backend settings.MAS_ID / settings.WORKSPACE_ID (fallback)
+    resolves workspace_id and mas_id from the room's DB record.
 
-    This test simulates a leaf node that doesn't know any IDs.
+    We deliberately exercise *two* distinct rooms (`ctx.room_name` and a
+    fresh `*-alt` sibling) instead of the legacy "no room_name → fall back
+    to settings.MAS_ID" path; CFN's per-room MAS model means the global
+    fallback is at best ambiguous and at worst routes writes to the wrong
+    workspace, so anchoring every call to a real room is the contract we
+    want to lock in.
     """
     print_section(8, "Knowledge graph (CFN-compatible API)")
 
@@ -1623,13 +1731,17 @@ def test_ioc_cfn(ctx: TestContext):
     status, body = http_get(f"{BACKEND_URL}/cfn/knowledge/list?limit=1")
     if status == 503:
         check(ctx, "Knowledge ingest (room_name)", False, skipped=True, skip_reason="CFN not configured")
-        check(ctx, "Knowledge ingest (no room)", False, skipped=True, skip_reason="CFN not configured")
+        check(ctx, "Knowledge ingest (alt room)", False, skipped=True, skip_reason="CFN not configured")
         check(ctx, "Knowledge query", False, skipped=True, skip_reason="CFN not configured")
         return
 
     # Test 1: Ingest with room_name only (leaf node scenario with room context)
     # Backend resolves mas_id from room DB or falls back to settings
-    # Note: CFN ingest involves LLM calls for knowledge extraction, so use longer timeout
+    # Note: CFN ingest involves LLM calls for knowledge extraction, so use a
+    # generous timeout. node-svc is single-worker / single-event-loop, so if a
+    # peer test (e.g. test_06d / test_15) is currently mid-negotiation, our
+    # ingest request will queue behind it. A solo ingest is ~5s; under load
+    # we need to absorb the upstream negotiation's full ~125s before our slot.
     ingest_url = f"{BACKEND_URL}/knowledge/ingest"
     test_marker = f"e2e-test-{uuid.uuid4().hex[:8]}"
     ingest_data = {
@@ -1637,7 +1749,7 @@ def test_ioc_cfn(ctx: TestContext):
         "agent_id": "e2e-test-agent",
         "records": [{"response": f"E2E test knowledge marker: {test_marker}. The weather is sunny in the city."}],
     }
-    status, body = http_post(ingest_url, ingest_data, timeout=30)
+    status, body = http_post(ingest_url, ingest_data, timeout=180)
     error_msg = None
     resolved_mas_id = None
     if status != 200:
@@ -1666,41 +1778,77 @@ def test_ioc_cfn(ctx: TestContext):
             pass
     check(ctx, "Knowledge ingest (room_name)", status == 200 and error_msg is None, error=error_msg)
 
-    # Test 2: Ingest with NO room_name (leaf node scenario without room context)
-    # Backend falls back to settings.MAS_ID
-    ingest_data_no_room = {
-        "agent_id": "e2e-test-agent-no-room",
-        "records": [{"response": f"E2E fallback test: {test_marker}. Temperature is warm today."}],
-    }
-    status, body = http_post(ingest_url, ingest_data_no_room, timeout=30)
-    error_msg = None
-    if status != 200:
-        error_msg = f"HTTP {status}"
-        if body:
-            try:
-                err_json = json.loads(body)
-                if "detail" in err_json:
-                    error_msg += f": {err_json['detail']}"
-            except:
-                error_msg += f"\n{body[:200]}"
+    # Test 2: Ingest into a SECOND room — proves backend routes per-room
+    # (each room has its own MAS, resolved from the room's DB record).
+    #
+    # This replaces the legacy "ingest with no room_name" check that relied
+    # on settings.MAS_ID as a global fallback.  CFN's per-room MAS model
+    # makes that fallback architecturally suspect (silent wrong-MAS writes
+    # if it ever points at the wrong row), and IOC-mode installs leave it
+    # unset anyway.  Going through a real room exercises the same leaf-node
+    # ergonomics ("client only knows the room name") without depending on
+    # the suspect fallback path.
+    alt_room_name = f"{test_marker}-alt"
+    status, body = http_post(
+        f"{BACKEND_URL}/rooms", {"name": alt_room_name, "is_public": True}
+    )
+    if status not in (200, 201):
+        check(
+            ctx,
+            "Knowledge ingest (alt room)",
+            False,
+            error=f"alt room create failed: HTTP {status}",
+        )
     else:
-        try:
-            resp = json.loads(body)
-            cfn_msg = resp.get("cfn_message", "")
-            if "error" in cfn_msg.lower() or "fail" in cfn_msg.lower():
-                error_msg = f"CFN error: {cfn_msg}"
-        except:
-            pass
-    check(ctx, "Knowledge ingest (no room)", status == 200 and error_msg is None, error=error_msg)
+        register_room(ctx, alt_room_name)
+        ingest_data_alt = {
+            "room_name": alt_room_name,
+            "agent_id": "e2e-test-agent-alt",
+            "records": [
+                {
+                    "response": f"E2E alt-room test: {test_marker}. Temperature is warm today."
+                }
+            ],
+        }
+        status, body = http_post(ingest_url, ingest_data_alt, timeout=180)
+        error_msg = None
+        if status != 200:
+            error_msg = f"HTTP {status}"
+            if body:
+                try:
+                    err_json = json.loads(body)
+                    if "detail" in err_json:
+                        error_msg += f": {err_json['detail']}"
+                except:
+                    error_msg += f"\n{body[:200]}"
+        else:
+            try:
+                resp = json.loads(body)
+                cfn_msg = resp.get("cfn_message", "")
+                if "error" in cfn_msg.lower() or "fail" in cfn_msg.lower():
+                    error_msg = f"CFN error: {cfn_msg}"
+            except:
+                pass
+        check(
+            ctx,
+            "Knowledge ingest (alt room)",
+            status == 200 and error_msg is None,
+            error=error_msg,
+        )
 
-    # Test 3: Query endpoint — also doesn't require explicit mas_id
-    # Backend resolves from settings.MAS_ID when not provided
+    # Test 3: Query endpoint with the mas_id we resolved in Test 1 — proves
+    # the write-then-read round trip works end-to-end without depending on
+    # settings.MAS_ID.  We pass mas_id explicitly because /cfn/knowledge/query
+    # has no room_name parameter today (see cfn_proxy.py); the natural way
+    # to scope a read is by mas_id, and we extracted that from Test 1's
+    # cfn_message ("graph_<mas-id-with-underscores>").
     query_url = f"{BACKEND_URL}/cfn/knowledge/query"
-    query_data = {
-        "intent": "Find information about weather conditions",
-        # No mas_id — backend resolves from settings
-    }
-    status, body = http_post(query_url, query_data, timeout=30)
+    query_data: dict = {"intent": "Find information about weather conditions"}
+    if resolved_mas_id:
+        query_data["mas_id"] = resolved_mas_id
+    # Same single-worker reasoning as the ingest above — queueing behind an
+    # in-flight CFN negotiation can easily exceed 30s.
+    status, body = http_post(query_url, query_data, timeout=180)
     error_msg = None
     if status != 200:
         error_msg = f"HTTP {status}"
@@ -1879,8 +2027,14 @@ def test_ioc_negotiation_path(ctx: TestContext):
         "n_steps": 5
     }
     
-    # Use longer timeout - LLM calls can take time
-    status, body = http_post(nego_url, session_payload, timeout=120)
+    # Use longer timeout — node-svc 0.1.6 added a `generate_options_with_memory`
+    # path that fires a self-call to its own /shared-memories/query and waits
+    # the full upstream 120s timeout before falling back to LLM-only. Total
+    # observed start_negotiation wall time is ~125-130s on the fallback path,
+    # so 120s here would always lose the race. 240s gives enough headroom for
+    # the 120s self-call timeout + LLM-only fallback + node-svc queuing under
+    # load (single uvicorn worker serializes everything on one event loop).
+    status, body = http_post(nego_url, session_payload, timeout=240)
     
     session_created = status in (200, 201, 202)
     error_msg = None
